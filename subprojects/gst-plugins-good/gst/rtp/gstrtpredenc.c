@@ -89,7 +89,8 @@ enum
   PROP_PT,
   PROP_SENT,
   PROP_DISTANCE,
-  PROP_ALLOW_NO_RED_BLOCKS
+  PROP_ALLOW_NO_RED_BLOCKS,
+  PROP_EXCLUDE_PT
 };
 
 static void
@@ -152,17 +153,15 @@ _alloc_red_packet_and_fill_headers (GstRtpRedEnc * self,
   guint8 *red_block_header;
   GstRTPBuffer red_rtp = GST_RTP_BUFFER_INIT;
   guint i;
+  guint16 ext_bits = 0;
+  gpointer inp_ext_data = NULL;
+  guint inp_ext_words = 0;
+  gboolean copied_extensions = FALSE;
 
   if (!gst_rtp_buffer_map (red, GST_MAP_WRITE, &red_rtp))
     g_assert_not_reached ();
 
   /* Copying RTP header of incoming packet */
-  if (gst_rtp_buffer_get_extension (inp_rtp)
-      && !self->ignoring_extension_warned) {
-    GST_FIXME_OBJECT (self, "Ignoring RTP extension");
-    self->ignoring_extension_warned = TRUE;
-  }
-
   gst_rtp_buffer_set_marker (&red_rtp, gst_rtp_buffer_get_marker (inp_rtp));
   gst_rtp_buffer_set_payload_type (&red_rtp, self->pt);
   gst_rtp_buffer_set_seq (&red_rtp, gst_rtp_buffer_get_seq (inp_rtp));
@@ -171,6 +170,23 @@ _alloc_red_packet_and_fill_headers (GstRtpRedEnc * self,
   for (i = 0; i != csrc_count; ++i)
     gst_rtp_buffer_set_csrc (&red_rtp, i,
         gst_rtp_buffer_get_csrc ((inp_rtp), i));
+
+  if (gst_rtp_buffer_get_extension_data (inp_rtp, &ext_bits, &inp_ext_data,
+          &inp_ext_words) && inp_ext_words > 0) {
+    gpointer red_ext_data = NULL;
+    guint red_ext_words = 0;
+
+    gst_rtp_buffer_set_extension_data (&red_rtp, ext_bits, inp_ext_words);
+    if (gst_rtp_buffer_get_extension_data (&red_rtp, NULL, &red_ext_data,
+            &red_ext_words) && red_ext_words == inp_ext_words) {
+      memcpy (red_ext_data, inp_ext_data, inp_ext_words * sizeof (guint32));
+      copied_extensions = TRUE;
+    } else {
+      GST_WARNING_OBJECT (self,
+          "Failed to copy RTP extensions to RED wrapper (profile=0x%04x words=%u)",
+          ext_bits, inp_ext_words);
+    }
+  }
 
   /* Filling RED block headers */
   red_block_header = gst_rtp_buffer_get_payload (&red_rtp);
@@ -188,9 +204,10 @@ _alloc_red_packet_and_fill_headers (GstRtpRedEnc * self,
   rtp_red_block_set_payload_type (red_block_header,
       gst_rtp_buffer_get_payload_type (inp_rtp));
 
-  /* FIXME: remove that logic once https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/923
-   * has been addressed. */
-  if (self->twcc_ext_id != 0) {
+  /* Backward-compatible fallback: if the input packet carried only a logical
+   * TWCC request marker that was not copied as part of an RTP extension block,
+   * preserve the old behaviour and add an empty TWCC extension on the wrapper. */
+  if (!copied_extensions && self->twcc_ext_id != 0) {
     guint8 appbits;
     gpointer inp_data;
     guint inp_size;
@@ -374,6 +391,14 @@ gst_rtp_red_enc_chain (GstPad G_GNUC_UNUSED * pad, GstObject * parent,
   if (!gst_rtp_buffer_map (buffer, GST_MAP_READ, &rtp))
     return _pad_push (self, buffer, self->is_current_caps_red);
 
+  if (self->exclude_pt >= 0) {
+    guint8 incoming_pt = gst_rtp_buffer_get_payload_type (&rtp);
+    if (incoming_pt == (guint8) self->exclude_pt) {
+      gst_rtp_buffer_unmap (&rtp);
+      return _pad_push (self, buffer, FALSE);
+    }
+  }
+
   /* If can't get data for redundant block push the packet as is */
   redundant_block = _red_history_get_redundant_block (self,
       gst_rtp_buffer_get_timestamp (&rtp), distance);
@@ -479,6 +504,7 @@ gst_rtp_red_enc_init (GstRtpRedEnc * self)
   self->num_sent = 0;
   self->rtp_history = g_queue_new ();
   self->ignoring_extension_warned = FALSE;
+  self->exclude_pt = -1;
 }
 
 
@@ -500,6 +526,9 @@ gst_rtp_red_enc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_ALLOW_NO_RED_BLOCKS:
       self->allow_no_red_blocks = g_value_get_boolean (value);
+      break;
+    case PROP_EXCLUDE_PT:
+      self->exclude_pt = g_value_get_int (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -524,6 +553,9 @@ gst_rtp_red_enc_get_property (GObject * object, guint prop_id,
       break;
     case PROP_ALLOW_NO_RED_BLOCKS:
       g_value_set_boolean (value, self->allow_no_red_blocks);
+      break;
+    case PROP_EXCLUDE_PT:
+      g_value_set_int (value, self->exclude_pt);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -582,6 +614,12 @@ gst_rtp_red_enc_class_init (GstRtpRedEncClass * klass)
           "false - RED packets will be produced only if distance>0",
           DEFAULT_ALLOW_NO_RED_BLOCKS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (G_OBJECT_CLASS (klass), PROP_EXCLUDE_PT,
+      g_param_spec_int ("exclude-pt", "Exclude payload type",
+          "Pass through packets matching this PT unchanged (no RED wrapping). "
+          "-1 means wrap all incoming packets (default behavior).",
+          -1, 127, -1, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   GST_DEBUG_CATEGORY_INIT (gst_rtp_red_enc_debug, "rtpredenc", 0,
       "RTP RED Encoder");

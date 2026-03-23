@@ -129,6 +129,18 @@ enum
   PROP_QP_MAX_B,
 
   PROP_CONST_QUALITY,
+
+  /* av1 codec config */
+  PROP_ENABLE_INTRA_REFRESH,
+  PROP_INTRA_REFRESH_PERIOD,
+  PROP_INTRA_REFRESH_CNT,
+  PROP_REPEAT_SEQUENCE_HEADER,
+  PROP_ENABLE_LTR,
+  PROP_LTR_NUM_FRAMES,
+  PROP_ENABLE_TEMPORAL_SVC,
+  PROP_NUM_TEMPORAL_LAYERS,
+  PROP_MAX_NUM_REF_FRAMES_IN_DPB,
+  PROP_MAX_TEMPORAL_LAYERS_MINUS1,
 };
 
 #define DEFAULT_PRESET            GST_NV_ENCODER_PRESET_DEFAULT
@@ -152,6 +164,17 @@ enum
 #define DEFAULT_STRICT_GOP        FALSE
 #define DEFAULT_AQ_STRENGTH       FALSE
 #define DEFAULT_CONST_QUALITY     0
+
+#define DEFAULT_ENABLE_INTRA_REFRESH        FALSE
+#define DEFAULT_INTRA_REFRESH_PERIOD        0
+#define DEFAULT_INTRA_REFRESH_CNT           0
+#define DEFAULT_REPEAT_SEQUENCE_HEADER      TRUE
+#define DEFAULT_ENABLE_LTR                  FALSE
+#define DEFAULT_LTR_NUM_FRAMES              0
+#define DEFAULT_ENABLE_TEMPORAL_SVC         FALSE
+#define DEFAULT_NUM_TEMPORAL_LAYERS         1
+#define DEFAULT_MAX_NUM_REF_FRAMES_IN_DPB   0
+#define DEFAULT_MAX_TEMPORAL_LAYERS_MINUS1  0
 
 typedef struct _GstNvAv1Encoder
 {
@@ -199,6 +222,18 @@ typedef struct _GstNvAv1Encoder
   gint qp_max_p;
   gint qp_max_b;
   gdouble const_quality;
+
+  /* av1 codec config */
+  gboolean enable_intra_refresh;
+  guint intra_refresh_period;
+  guint intra_refresh_cnt;
+  gboolean repeat_sequence_header;
+  gboolean enable_ltr;
+  guint ltr_num_frames;
+  gboolean enable_temporal_svc;
+  guint num_temporal_layers;
+  guint max_num_ref_frames_in_dpb;
+  guint max_temporal_layers_minus1;
 } GstNvAv1Encoder;
 
 typedef struct _GstNvAv1EncoderClass
@@ -439,6 +474,50 @@ gst_nv_av1_encoder_class_init (GstNvAv1EncoderClass * klass, gpointer data)
           "Target Constant Quality level for VBR mode (0 = automatic)",
           0, 51, DEFAULT_CONST_QUALITY, param_flags));
 
+  /* av1 codec config properties */
+  g_object_class_install_property (object_class, PROP_ENABLE_INTRA_REFRESH,
+      g_param_spec_boolean ("enable-intra-refresh", "Enable Intra Refresh",
+          "Enable intra refresh",
+          DEFAULT_ENABLE_INTRA_REFRESH, param_flags));
+  g_object_class_install_property (object_class, PROP_INTRA_REFRESH_PERIOD,
+      g_param_spec_uint ("intra-refresh-period", "Intra Refresh Period",
+          "Intra refresh period in number of frames (0 = disable)",
+          0, G_MAXUINT, DEFAULT_INTRA_REFRESH_PERIOD, param_flags));
+  g_object_class_install_property (object_class, PROP_INTRA_REFRESH_CNT,
+      g_param_spec_uint ("intra-refresh-cnt", "Intra Refresh Count",
+          "Number of frames over which intra refresh happens",
+          0, G_MAXUINT, DEFAULT_INTRA_REFRESH_CNT, param_flags));
+  g_object_class_install_property (object_class, PROP_REPEAT_SEQUENCE_HEADER,
+      g_param_spec_boolean ("repeat-sequence-header", "Repeat Sequence Header",
+          "Insert sequence header on every key frame",
+          DEFAULT_REPEAT_SEQUENCE_HEADER, param_flags));
+  g_object_class_install_property (object_class, PROP_ENABLE_LTR,
+      g_param_spec_boolean ("enable-ltr", "Enable LTR",
+          "Enable Long Term Reference frame support",
+          DEFAULT_ENABLE_LTR, param_flags));
+  g_object_class_install_property (object_class, PROP_LTR_NUM_FRAMES,
+      g_param_spec_uint ("ltr-num-frames", "LTR Num Frames",
+          "Number of LTR frames (0 = driver default)",
+          0, G_MAXUINT, DEFAULT_LTR_NUM_FRAMES, param_flags));
+  g_object_class_install_property (object_class, PROP_ENABLE_TEMPORAL_SVC,
+      g_param_spec_boolean ("enable-temporal-svc", "Enable Temporal SVC",
+          "Enable SVC temporal scalability",
+          DEFAULT_ENABLE_TEMPORAL_SVC, param_flags));
+  g_object_class_install_property (object_class, PROP_NUM_TEMPORAL_LAYERS,
+      g_param_spec_uint ("num-temporal-layers", "Num Temporal Layers",
+          "Number of temporal layers for hierarchical coding",
+          1, 4, DEFAULT_NUM_TEMPORAL_LAYERS, param_flags));
+  g_object_class_install_property (object_class, PROP_MAX_NUM_REF_FRAMES_IN_DPB,
+      g_param_spec_uint ("max-num-ref-frames-in-dpb",
+          "Max Num Ref Frames In DPB",
+          "Maximum number of reference frames in DPB (0 = driver default)",
+          0, 8, DEFAULT_MAX_NUM_REF_FRAMES_IN_DPB, param_flags));
+  g_object_class_install_property (object_class, PROP_MAX_TEMPORAL_LAYERS_MINUS1,
+      g_param_spec_uint ("max-temporal-layers-minus1",
+          "Max Temporal Layers Minus 1",
+          "Maximum temporal layers minus 1 (0 = driver default)",
+          0, 3, DEFAULT_MAX_TEMPORAL_LAYERS_MINUS1, param_flags));
+
   GstPadTemplate *pad_templ = gst_pad_template_new ("sink",
       GST_PAD_SINK, GST_PAD_ALWAYS, cdata->sink_caps);
   GstCaps *doc_caps = nullptr;
@@ -546,6 +625,17 @@ gst_nv_av1_encoder_init (GstNvAv1Encoder * self)
   self->qp_max_p = DEFAULT_QP;
   self->qp_max_b = DEFAULT_QP;
   self->const_quality = DEFAULT_CONST_QUALITY;
+
+  self->enable_intra_refresh = DEFAULT_ENABLE_INTRA_REFRESH;
+  self->intra_refresh_period = DEFAULT_INTRA_REFRESH_PERIOD;
+  self->intra_refresh_cnt = DEFAULT_INTRA_REFRESH_CNT;
+  self->repeat_sequence_header = DEFAULT_REPEAT_SEQUENCE_HEADER;
+  self->enable_ltr = DEFAULT_ENABLE_LTR;
+  self->ltr_num_frames = DEFAULT_LTR_NUM_FRAMES;
+  self->enable_temporal_svc = DEFAULT_ENABLE_TEMPORAL_SVC;
+  self->num_temporal_layers = DEFAULT_NUM_TEMPORAL_LAYERS;
+  self->max_num_ref_frames_in_dpb = DEFAULT_MAX_NUM_REF_FRAMES_IN_DPB;
+  self->max_temporal_layers_minus1 = DEFAULT_MAX_TEMPORAL_LAYERS_MINUS1;
 
   gst_nv_encoder_set_device_mode (GST_NV_ENCODER (self), klass->device_mode,
       klass->cuda_device_id, klass->adapter_luid);
@@ -811,6 +901,36 @@ gst_nv_av1_encoder_set_property (GObject * object, guint prop_id,
     case PROP_CONST_QUALITY:
       update_double (self, &self->const_quality, value, UPDATE_RC_PARAM);
       break;
+    case PROP_ENABLE_INTRA_REFRESH:
+      update_boolean (self, &self->enable_intra_refresh, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_INTRA_REFRESH_PERIOD:
+      update_uint (self, &self->intra_refresh_period, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_INTRA_REFRESH_CNT:
+      update_uint (self, &self->intra_refresh_cnt, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_REPEAT_SEQUENCE_HEADER:
+      update_boolean (self, &self->repeat_sequence_header, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_ENABLE_LTR:
+      update_boolean (self, &self->enable_ltr, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_LTR_NUM_FRAMES:
+      update_uint (self, &self->ltr_num_frames, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_ENABLE_TEMPORAL_SVC:
+      update_boolean (self, &self->enable_temporal_svc, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_NUM_TEMPORAL_LAYERS:
+      update_uint (self, &self->num_temporal_layers, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_MAX_NUM_REF_FRAMES_IN_DPB:
+      update_uint (self, &self->max_num_ref_frames_in_dpb, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_MAX_TEMPORAL_LAYERS_MINUS1:
+      update_uint (self, &self->max_temporal_layers_minus1, value, UPDATE_INIT_PARAM);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -918,6 +1038,36 @@ gst_nv_av1_encoder_get_property (GObject * object, guint prop_id,
       break;
     case PROP_CONST_QUALITY:
       g_value_set_double (value, self->const_quality);
+      break;
+    case PROP_ENABLE_INTRA_REFRESH:
+      g_value_set_boolean (value, self->enable_intra_refresh);
+      break;
+    case PROP_INTRA_REFRESH_PERIOD:
+      g_value_set_uint (value, self->intra_refresh_period);
+      break;
+    case PROP_INTRA_REFRESH_CNT:
+      g_value_set_uint (value, self->intra_refresh_cnt);
+      break;
+    case PROP_REPEAT_SEQUENCE_HEADER:
+      g_value_set_boolean (value, self->repeat_sequence_header);
+      break;
+    case PROP_ENABLE_LTR:
+      g_value_set_boolean (value, self->enable_ltr);
+      break;
+    case PROP_LTR_NUM_FRAMES:
+      g_value_set_uint (value, self->ltr_num_frames);
+      break;
+    case PROP_ENABLE_TEMPORAL_SVC:
+      g_value_set_boolean (value, self->enable_temporal_svc);
+      break;
+    case PROP_NUM_TEMPORAL_LAYERS:
+      g_value_set_uint (value, self->num_temporal_layers);
+      break;
+    case PROP_MAX_NUM_REF_FRAMES_IN_DPB:
+      g_value_set_uint (value, self->max_num_ref_frames_in_dpb);
+      break;
+    case PROP_MAX_TEMPORAL_LAYERS_MINUS1:
+      g_value_set_uint (value, self->max_temporal_layers_minus1);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1154,25 +1304,26 @@ gst_nv_av1_encoder_set_format (GstNvEncoder * encoder,
   /* TODO: Maybe useful for debugging, but not required for decoding */
   av1_config->enableFrameIdNumbers = FALSE;
   av1_config->disableSeqHdr = FALSE;
-  av1_config->repeatSeqHdr = TRUE;
-  /* TODO: property */
-  av1_config->enableIntraRefresh = FALSE;
-  /* TODO: main profile only for now */
+  av1_config->repeatSeqHdr = self->repeat_sequence_header;
+  av1_config->enableIntraRefresh = self->enable_intra_refresh;
   av1_config->chromaFormatIDC = 1;
   av1_config->enableBitstreamPadding = FALSE;
-  /* TODO: property and configure tile info accordingly */
   av1_config->enableCustomTileConfig = FALSE;
-  /* TODO: property, support user specified film grain params */
   av1_config->enableFilmGrainParams = FALSE;
-  av1_config->inputPixelBitDepthMinus8 = bitdepth_minus8;
-  av1_config->pixelBitDepthMinus8 = bitdepth_minus8;
+  av1_config->outputBitDepth = (NV_ENC_BIT_DEPTH)(bitdepth_minus8 + 8);
+  av1_config->inputBitDepth  = (NV_ENC_BIT_DEPTH)(bitdepth_minus8 + 8);
   av1_config->idrPeriod = config->gopLength;
 
-  /* TODO: support intra refresh */
-  av1_config->intraRefreshPeriod = 0;
-  av1_config->intraRefreshCnt = 0;
+  av1_config->intraRefreshPeriod = self->intra_refresh_period;
+  av1_config->intraRefreshCnt = self->intra_refresh_cnt;
 
-  av1_config->maxNumRefFramesInDPB = 0;
+  av1_config->enableLTR = self->enable_ltr;
+  av1_config->ltrNumFrames = self->ltr_num_frames;
+  av1_config->enableTemporalSVC = self->enable_temporal_svc;
+  av1_config->numTemporalLayers = self->num_temporal_layers;
+
+  av1_config->maxNumRefFramesInDPB = self->max_num_ref_frames_in_dpb;
+  av1_config->maxTemporalLayersMinus1 = self->max_temporal_layers_minus1;
   av1_config->numFwdRefs = NV_ENC_NUM_REF_FRAMES_AUTOSELECT;
   av1_config->numBwdRefs = NV_ENC_NUM_REF_FRAMES_AUTOSELECT;
 

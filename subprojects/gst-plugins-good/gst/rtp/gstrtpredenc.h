@@ -59,6 +59,8 @@ struct _GstRtpRedEnc {
   guint8 twcc_ext_id;
 
   gboolean ignoring_extension_warned;
+
+  gint exclude_pt; /* -1 = wrap all PTs; >= 0 = pass through this PT unchanged */
 };
 
 GType gst_rtp_red_enc_get_type (void);

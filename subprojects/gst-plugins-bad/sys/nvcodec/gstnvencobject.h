@@ -101,6 +101,16 @@ gst_clear_nv_encoder_resource (GstNvEncResource ** resource)
 #define GST_TYPE_NV_ENC_TASK (gst_nv_enc_task_get_type ())
 struct GstNvEncTask;
 
+typedef struct _GstNvEncH264PtdDecision
+{
+  gboolean valid;
+  NV_ENC_PIC_TYPE picture_type;
+  guint32 display_poc_syntax;
+  guint32 ref_pic_flag;
+  guint32 temporal_layer;
+  guint32 encode_pic_flags;
+} GstNvEncH264PtdDecision;
+
 GType gst_nv_enc_task_get_type (void);
 
 gboolean    gst_nv_enc_task_set_buffer (GstNvEncTask * task,
@@ -111,6 +121,12 @@ gboolean    gst_nv_enc_task_set_resource (GstNvEncTask * task,
                                           GstNvEncResource * resource);
 
 GArray *    gst_nv_enc_task_get_sei_payload (GstNvEncTask * task);
+
+void        gst_nv_enc_task_set_h264_ptd_decision (GstNvEncTask * task,
+                                                    const GstNvEncH264PtdDecision * decision);
+
+gboolean    gst_nv_enc_task_get_h264_ptd_decision (GstNvEncTask * task,
+                                                    GstNvEncH264PtdDecision * decision);
 
 NVENCSTATUS gst_nv_enc_task_lock_bitstream (GstNvEncTask * task,
                                             NV_ENC_LOCK_BITSTREAM * bitstream);

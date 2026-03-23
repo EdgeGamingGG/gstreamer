@@ -880,6 +880,65 @@ GST_START_TEST (test_h264_parse_partial_nal_header)
 
 GST_END_TEST;
 
+GST_START_TEST (test_h264_parse_svc_slice_ext)
+{
+  GstH264ParserResult res;
+  GstH264NalUnit sps_nalu;
+  GstH264NalUnit pps_nalu;
+  GstH264NalUnit svc_nalu;
+  GstH264SPS sps = { 0, };
+  GstH264PPS pps = { 0, };
+  GstH264SliceHdr slice = { 0, };
+  GstH264NalParser *const parser = gst_h264_nal_parser_new ();
+  static const guint8 h264_sps[] = {
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x4d, 0x40, 0x15,
+    0xec, 0xa4, 0xbf, 0x2e, 0x02, 0x20, 0x00, 0x00,
+    0x03, 0x00, 0x2e, 0xe6, 0xb2, 0x80, 0x01, 0xe2,
+    0xc5, 0xb2, 0xc0
+  };
+  static const guint8 h264_pps[] = {
+    0x00, 0x00, 0x00, 0x01, 0x68, 0xeb, 0xec, 0xb2
+  };
+  static const guint8 h264_svc_idr[] = {
+    0x00, 0x00, 0x00, 0x01,
+    0x74, 0xc0, 0x80, 0x4f,
+    0x88, 0x84, 0x00, 0x10, 0xff, 0xfe, 0xf6, 0xf0,
+    0xfe, 0x05, 0x36, 0x56, 0x04, 0x50, 0x96, 0x7b,
+    0x3f, 0x53, 0xe1
+  };
+
+  res = gst_h264_parser_identify_nalu (parser, h264_sps, 0, sizeof (h264_sps),
+      &sps_nalu);
+  assert_equals_int (res, GST_H264_PARSER_OK);
+  res = gst_h264_parser_parse_sps (parser, &sps_nalu, &sps);
+  assert_equals_int (res, GST_H264_PARSER_OK);
+
+  res = gst_h264_parser_identify_nalu (parser, h264_pps, 0, sizeof (h264_pps),
+      &pps_nalu);
+  assert_equals_int (res, GST_H264_PARSER_OK);
+  res = gst_h264_parser_parse_pps (parser, &pps_nalu, &pps);
+  assert_equals_int (res, GST_H264_PARSER_OK);
+
+  res = gst_h264_parser_identify_nalu (parser, h264_svc_idr, 0,
+      sizeof (h264_svc_idr), &svc_nalu);
+  assert_equals_int (res, GST_H264_PARSER_OK);
+  fail_unless (GST_H264_IS_SVC_NALU (&svc_nalu));
+  assert_equals_int (svc_nalu.extension.svc.idr_flag, 1);
+  assert_equals_int (svc_nalu.extension.svc.temporal_id, 2);
+  assert_equals_int (svc_nalu.extension.svc.discardable_flag, 1);
+
+  res = gst_h264_parser_parse_slice_hdr (parser, &svc_nalu, &slice, FALSE, TRUE);
+  assert_equals_int (res, GST_H264_PARSER_OK);
+  assert_equals_int (slice.first_mb_in_slice, 0);
+  fail_unless (GST_H264_IS_I_SLICE (&slice));
+
+  gst_h264_sps_clear (&sps);
+  gst_h264_pps_clear (&pps);
+  gst_h264_nal_parser_free (parser);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_h264_split_avc)
 {
   GstH264NalParser *parser;
@@ -1141,6 +1200,7 @@ h264parser_suite (void)
   tcase_add_test (tc_chain, test_h264_create_sei);
   tcase_add_test (tc_chain, test_h264_decoder_config_record);
   tcase_add_test (tc_chain, test_h264_parse_partial_nal_header);
+  tcase_add_test (tc_chain, test_h264_parse_svc_slice_ext);
   tcase_add_test (tc_chain, test_h264_split_avc);
   tcase_add_test (tc_chain, test_h264_parse_overflow_framerate);
 

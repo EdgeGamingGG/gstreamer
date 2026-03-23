@@ -153,7 +153,8 @@ gst_rtp_header_extension_twcc_get_property (GObject * object, guint prop_id,
 static GstRTPHeaderExtensionFlags
 gst_rtp_header_extension_twcc_get_supported_flags (GstRTPHeaderExtension * ext)
 {
-  return GST_RTP_HEADER_EXTENSION_ONE_BYTE;
+  return GST_RTP_HEADER_EXTENSION_ONE_BYTE |
+      GST_RTP_HEADER_EXTENSION_TWO_BYTE;
 }
 
 static gsize

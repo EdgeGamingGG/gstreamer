@@ -347,33 +347,37 @@ gst_nvenc_load_library (guint * api_major_ver, guint * api_minor_ver)
   /* WARNING: Any developers who want to bump SDK version must ensure that
    * following macro values were not changed and also need to check ABI compatibility.
    * Otherwise, gst_nvenc_get_ helpers also should be updated.
-   * Currently SDK 8.1 and 9.0 compatible
+   * Currently SDK 8.1 through 13.0 compatible
    *
    * NVENCAPI_VERSION (NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24))
    *
    * NVENCAPI_STRUCT_VERSION(ver) ((uint32_t)NVENCAPI_VERSION | ((ver)<<16) | (0x7 << 28))
    *
-   * NV_ENC_CAPS_PARAM_VER                NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_ENCODE_OUT_PARAMS_VER         NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_CREATE_INPUT_BUFFER_VER       NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_CREATE_BITSTREAM_BUFFER_VER   NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_CREATE_MV_BUFFER_VER          NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_RC_PARAMS_VER                 NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_CONFIG_VER                   (NVENCAPI_STRUCT_VERSION(7) | ( 1<<31 ))
-   * NV_ENC_INITIALIZE_PARAMS_VER        (NVENCAPI_STRUCT_VERSION(5) | ( 1<<31 ))
-   * NV_ENC_RECONFIGURE_PARAMS_VER       (NVENCAPI_STRUCT_VERSION(1) | ( 1<<31 ))
-   * NV_ENC_PRESET_CONFIG_VER            (NVENCAPI_STRUCT_VERSION(4) | ( 1<<31 ))
-   * NV_ENC_PIC_PARAMS_VER               (NVENCAPI_STRUCT_VERSION(4) | ( 1<<31 ))
-   * NV_ENC_MEONLY_PARAMS_VER             NVENCAPI_STRUCT_VERSION(3)
-   * NV_ENC_LOCK_BITSTREAM_VER            NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_LOCK_INPUT_BUFFER_VER         NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_MAP_INPUT_RESOURCE_VER        NVENCAPI_STRUCT_VERSION(4)
-   * NV_ENC_REGISTER_RESOURCE_VER         NVENCAPI_STRUCT_VERSION(3)
-   * NV_ENC_STAT_VER                      NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER    NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_EVENT_PARAMS_VER              NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER NVENCAPI_STRUCT_VERSION(1)
-   * NV_ENCODE_API_FUNCTION_LIST_VER      NVENCAPI_STRUCT_VERSION(2)
+   * NOTE: Some helpers intentionally treat SDK <= 12 the same because those
+   * struct versions are identical between SDK 11.x and 12.x.
+   *
+   *                                          <= SDK 11   SDK 12   SDK 13
+   * NV_ENC_CAPS_PARAM_VER                    ver(1)      ver(1)   ver(1)
+   * NV_ENC_ENCODE_OUT_PARAMS_VER             ver(1)      ver(1)   ver(1)
+   * NV_ENC_CREATE_INPUT_BUFFER_VER           ver(1)      ver(1)   ver(2)
+   * NV_ENC_CREATE_BITSTREAM_BUFFER_VER       ver(1)      ver(1)   ver(1)
+   * NV_ENC_CREATE_MV_BUFFER_VER              ver(1)      ver(1)   ver(2)
+   * NV_ENC_RC_PARAMS_VER                     ver(1)      ver(1)   ver(1)
+   * NV_ENC_CONFIG_VER                        ver(7)|B31  ver(8)|B31  ver(9)|B31
+   * NV_ENC_INITIALIZE_PARAMS_VER             ver(5)|B31  ver(5)|B31  ver(7)|B31
+   * NV_ENC_RECONFIGURE_PARAMS_VER            ver(1)|B31  ver(1)|B31  ver(2)|B31
+   * NV_ENC_PRESET_CONFIG_VER                 ver(4)|B31  ver(4)|B31  ver(5)|B31
+   * NV_ENC_PIC_PARAMS_VER                    ver(4)|B31  ver(4)|B31  ver(7)|B31
+   * NV_ENC_MEONLY_PARAMS_VER                 ver(3)      ver(3)   ver(4)
+   * NV_ENC_LOCK_BITSTREAM_VER                ver(1)      ver(1)   ver(2)|B31
+   * NV_ENC_LOCK_INPUT_BUFFER_VER            ver(1)      ver(1)   ver(1)
+   * NV_ENC_MAP_INPUT_RESOURCE_VER           ver(4)      ver(4)   ver(4)
+   * NV_ENC_REGISTER_RESOURCE_VER            ver(3)      ver(3)   ver(5)
+   * NV_ENC_STAT_VER                         ver(1)      ver(1)   ver(2)
+   * NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER       ver(1)      ver(1)   ver(1)
+   * NV_ENC_EVENT_PARAMS_VER                 ver(1)      ver(1)   ver(2)
+   * NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER ver(1)     ver(1)   ver(1)
+   * NV_ENCODE_API_FUNCTION_LIST_VER         ver(2)      ver(2)   ver(2)
    */
 
   ret = nvEncodeAPIGetMaxSupportedVersion (&max_supported_version);
@@ -475,7 +479,8 @@ gst_nvenc_get_create_input_buffer_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_CREATE_INPUT_BUFFER_VER;
 #else
-  /* NV_ENC_CREATE_INPUT_BUFFER_VER == NVENCAPI_STRUCT_VERSION(1) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (2, gst_nvenc_api_version);
   return GST_NVENCAPI_STRUCT_VERSION (1, gst_nvenc_api_version);
 #endif
 }
@@ -497,7 +502,8 @@ gst_nvenc_get_create_mv_buffer_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_CREATE_MV_BUFFER_VER;
 #else
-  /* NV_ENC_CREATE_MV_BUFFER_VER == NVENCAPI_STRUCT_VERSION(1) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (2, gst_nvenc_api_version);
   return GST_NVENCAPI_STRUCT_VERSION (1, gst_nvenc_api_version);
 #endif
 }
@@ -519,12 +525,10 @@ gst_nvenc_get_config_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_CONFIG_VER;
 #else
-  /* Version updated since SDK 12.0 */
-  if ((gst_nvenc_api_version & 12) == 12)
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (9, gst_nvenc_api_version) | (1 << 31);
+  if ((gst_nvenc_api_version & 0xff) >= 12)
     return GST_NVENCAPI_STRUCT_VERSION (8, gst_nvenc_api_version) | (1 << 31);
-
-  /* NV_ENC_CONFIG_VER ==
-   *   (NVENCAPI_STRUCT_VERSION(7) | ( 1<<31 )) */
   return GST_NVENCAPI_STRUCT_VERSION (7, gst_nvenc_api_version) | (1 << 31);
 #endif
 }
@@ -535,8 +539,8 @@ gst_nvenc_get_initialize_params_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_INITIALIZE_PARAMS_VER;
 #else
-  /* NV_ENC_INITIALIZE_PARAMS_VER ==
-   *   (NVENCAPI_STRUCT_VERSION(5) | ( 1<<31 )) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (7, gst_nvenc_api_version) | (1 << 31);
   return GST_NVENCAPI_STRUCT_VERSION (5, gst_nvenc_api_version) | (1 << 31);
 #endif
 }
@@ -547,8 +551,8 @@ gst_nvenc_get_reconfigure_params_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_RECONFIGURE_PARAMS_VER;
 #else
-  /* NV_ENC_RECONFIGURE_PARAMS_VER ==
-   *   (NVENCAPI_STRUCT_VERSION(1) | ( 1<<31 )) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (2, gst_nvenc_api_version) | (1 << 31);
   return GST_NVENCAPI_STRUCT_VERSION (1, gst_nvenc_api_version) | (1 << 31);
 #endif
 }
@@ -559,8 +563,8 @@ gst_nvenc_get_preset_config_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_PRESET_CONFIG_VER;
 #else
-  /* NV_ENC_PRESET_CONFIG_VER ==
-   *   (NVENCAPI_STRUCT_VERSION(4) | ( 1<<31 )) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (5, gst_nvenc_api_version) | (1 << 31);
   return GST_NVENCAPI_STRUCT_VERSION (4, gst_nvenc_api_version) | (1 << 31);
 #endif
 }
@@ -571,8 +575,8 @@ gst_nvenc_get_pic_params_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_PIC_PARAMS_VER;
 #else
-  /* NV_ENC_PIC_PARAMS_VER ==
-   *  (NVENCAPI_STRUCT_VERSION(4) | ( 1<<31 )) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (7, gst_nvenc_api_version) | (1 << 31);
   return GST_NVENCAPI_STRUCT_VERSION (4, gst_nvenc_api_version) | (1 << 31);
 #endif
 }
@@ -583,7 +587,8 @@ gst_nvenc_get_meonly_params_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_MEONLY_PARAMS_VER;
 #else
-  /* NV_ENC_MEONLY_PARAMS_VER == NVENCAPI_STRUCT_VERSION(3) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (4, gst_nvenc_api_version);
   return GST_NVENCAPI_STRUCT_VERSION (3, gst_nvenc_api_version);
 #endif
 }
@@ -594,7 +599,8 @@ gst_nvenc_get_lock_bitstream_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_LOCK_BITSTREAM_VER;
 #else
-  /* NV_ENC_LOCK_BITSTREAM_VER == NVENCAPI_STRUCT_VERSION(1) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (2, gst_nvenc_api_version) | (1 << 31);
   return GST_NVENCAPI_STRUCT_VERSION (1, gst_nvenc_api_version);
 #endif
 }
@@ -627,7 +633,8 @@ gst_nvenc_get_register_resource_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_REGISTER_RESOURCE_VER;
 #else
-  /* NV_ENC_REGISTER_RESOURCE_VER == NVENCAPI_STRUCT_VERSION(3) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (5, gst_nvenc_api_version);
   return GST_NVENCAPI_STRUCT_VERSION (3, gst_nvenc_api_version);
 #endif
 }
@@ -638,7 +645,8 @@ gst_nvenc_get_stat_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_STAT_VER;
 #else
-  /* NV_ENC_STAT_VER == NVENCAPI_STRUCT_VERSION(1) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (2, gst_nvenc_api_version);
   return GST_NVENCAPI_STRUCT_VERSION (1, gst_nvenc_api_version);
 #endif
 }
@@ -660,7 +668,8 @@ gst_nvenc_get_event_params_version (void)
 #if USE_STATIC_SDK_VER
   return NV_ENC_EVENT_PARAMS_VER;
 #else
-  /* NV_ENC_EVENT_PARAMS_VER == NVENCAPI_STRUCT_VERSION(1) */
+  if ((gst_nvenc_api_version & 0xff) >= 13)
+    return GST_NVENCAPI_STRUCT_VERSION (2, gst_nvenc_api_version);
   return GST_NVENCAPI_STRUCT_VERSION (1, gst_nvenc_api_version);
 #endif
 }
