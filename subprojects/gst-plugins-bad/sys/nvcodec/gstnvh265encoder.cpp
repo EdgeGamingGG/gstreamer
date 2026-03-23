@@ -1594,7 +1594,8 @@ gst_nv_h265_encoder_set_format (GstNvEncoder * encoder,
 
   hevc_config->level = NV_ENC_LEVEL_AUTOSELECT;
   hevc_config->chromaFormatIDC = chroma_format_index;
-  hevc_config->pixelBitDepthMinus8 = bitdepth_minus8;
+  hevc_config->outputBitDepth = (NV_ENC_BIT_DEPTH)(bitdepth_minus8 + 8);
+  hevc_config->inputBitDepth  = (NV_ENC_BIT_DEPTH)(bitdepth_minus8 + 8);
   hevc_config->idrPeriod = config->gopLength;
   hevc_config->outputAUD = self->aud;
   if (self->stream_format == GST_NV_H265_ENCODER_HVC1) {

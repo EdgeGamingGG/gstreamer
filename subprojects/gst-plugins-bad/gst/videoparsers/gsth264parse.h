@@ -34,6 +34,7 @@
 G_BEGIN_DECLS
 
 typedef struct _H264Params H264Params;
+typedef struct _GstH264ParsePictureInfo GstH264ParsePictureInfo;
 
 #define GST_TYPE_H264_PARSE \
   (gst_h264_parse_get_type())
@@ -50,6 +51,30 @@ GType gst_h264_parse_get_type (void);
 
 typedef struct _GstH264Parse GstH264Parse;
 typedef struct _GstH264ParseClass GstH264ParseClass;
+
+struct _GstH264ParsePictureInfo
+{
+  gboolean valid;
+  gboolean is_idr;
+  gboolean is_keyframe;
+  gboolean has_svc_extension;
+  guint8 slice_type;
+  guint8 temporal_id;
+  guint8 dependency_id;
+  guint8 quality_id;
+  guint8 discardable_flag;
+  guint8 output_flag;
+  guint8 use_ref_base_pic_flag;
+  guint8 ref_pic_flag;
+  guint16 frame_num;
+  gint32 display_poc;
+  guint8 max_num_ref_frames;
+  guint8 num_ref_idx_l0_active;
+  gboolean has_used_ref_mask_l0;
+  guint32 used_ref_mask_l0;
+  gboolean mmco5_reset;
+  gboolean resets_dpb;
+};
 
 struct _GstH264Parse
 {
@@ -144,10 +169,21 @@ struct _GstH264Parse
   gboolean frame_start;
   /* AU state */
   gboolean picture_start;
+  GstH264ParsePictureInfo picture_info;
+  gint32 prev_poc_msb;
+  guint16 prev_poc_lsb;
+  guint16 prev_frame_num;
+  gint32 prev_frame_num_offset;
+  gboolean have_prev_ref_pic_order;
+  gboolean have_prev_frame_num;
+  gboolean have_pending_svc_prefix;
+  gboolean saw_nonref_poc_interleave;
+  GstH264NalUnitExtensionSVC pending_svc_prefix;
 
   /* props */
   gint interval;
   gboolean update_timecode;
+  gboolean temporal_sps_fixup;
 
   GstClockTime pending_key_unit_ts;
   GstEvent *force_key_unit_event;

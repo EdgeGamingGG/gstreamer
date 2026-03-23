@@ -29,6 +29,7 @@
 #include <gst/cuda/gstcudastream.h>
 #include <gst/cuda/gstcuda-private.h>
 #include <gst/base/gstbytewriter.h>
+#include <gst/codecparsers/gsth264parser.h>
 #include <string.h>
 #include <mutex>
 #include <condition_variable>
@@ -58,15 +59,20 @@ GST_DEBUG_CATEGORY (gst_nv_encoder_debug);
 
 #define GST_NVENC_STATUS_FORMAT "s (%d)"
 #define GST_NVENC_STATUS_ARGS(s) nvenc_status_to_string (s), s
+#define GST_H264_TEMPORAL_META_NAME "GstH264TemporalMeta"
 
 enum
 {
   PROP_0,
   PROP_CC_INSERT,
   PROP_EXTERN_POOL,
+  PROP_PRESERVE_INPUT_PTS,
+  PROP_CONFIG_JSON,
 };
 
 #define DEFAULT_CC_INSERT GST_NV_ENCODER_SEI_INSERT
+#define DEFAULT_PRESERVE_INPUT_PTS FALSE
+#define DEFAULT_MIN_PTS (GST_SECOND * 60 * 60 * 1000)
 
 struct _GstNvEncoderPrivate
 {
@@ -78,6 +84,7 @@ struct _GstNvEncoderPrivate
 
    ~_GstNvEncoderPrivate ()
   {
+    g_free (config_json);
     gst_clear_object (&extern_pool);
   }
 
@@ -132,6 +139,13 @@ struct _GstNvEncoderPrivate
   /* properties */
   GstNvEncoderSeiInsertMode cc_insert = DEFAULT_CC_INSERT;
   GstBufferPool *extern_pool = nullptr;
+  gboolean preserve_input_pts = DEFAULT_PRESERVE_INPUT_PTS;
+  gchar *config_json = nullptr;
+
+  /* PTD-disabled H.264 decision state */
+  guint64 ptd_abs_frame_idx = 0;
+  guint64 ptd_gop_frame_idx = 0;
+  gboolean ptd_warned_layer_fallback = FALSE;
 };
 
 /**
@@ -168,6 +182,289 @@ static GstFlowReturn gst_nv_encoder_finish (GstVideoEncoder * encoder);
 static gboolean gst_nv_encoder_flush (GstVideoEncoder * encoder);
 static gboolean gst_nv_encoder_transform_meta (GstVideoEncoder * encoder,
     GstVideoCodecFrame * frame, GstMeta * meta);
+static void gst_nv_encoder_update_min_pts (GstNvEncoder * self);
+
+/* ---- GUID-to-string helper for JSON serialisation ---- */
+static gchar *
+guid_to_string (const GUID * g)
+{
+  return g_strdup_printf (
+      "%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+      g->Data1, g->Data2, g->Data3,
+      g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3],
+      g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
+}
+
+/* JSON-escape helper: wraps a string value so it is safe inside "..." */
+static void
+json_append_string (GString * s, const gchar * key, const gchar * val)
+{
+  g_string_append_printf (s, "    \"%s\": \"%s\",\n", key, val);
+}
+
+static void
+json_append_uint (GString * s, const gchar * key, guint val)
+{
+  g_string_append_printf (s, "    \"%s\": %u,\n", key, val);
+}
+
+static void
+json_append_int (GString * s, const gchar * key, gint val)
+{
+  g_string_append_printf (s, "    \"%s\": %d,\n", key, val);
+}
+
+static void
+json_append_bool (GString * s, const gchar * key, guint val)
+{
+  g_string_append_printf (s, "    \"%s\": %s,\n", key, val ? "true" : "false");
+}
+
+static void
+json_append_qp (GString * s, const gchar * key, const NV_ENC_QP * qp)
+{
+  g_string_append_printf (s,
+      "    \"%s\": { \"qpInterP\": %u, \"qpInterB\": %u, \"qpIntra\": %u },\n",
+      key, qp->qpInterP, qp->qpInterB, qp->qpIntra);
+}
+
+/* Opens a JSON sub-object with the given key */
+static void
+json_open_obj (GString * s, const gchar * key)
+{
+  g_string_append_printf (s, "    \"%s\": {\n", key);
+}
+
+/* Closes a JSON sub-object (removes trailing comma first) */
+static void
+json_close_obj (GString * s)
+{
+  /* remove trailing ",\n" and replace with "\n" */
+  if (s->len >= 2 && s->str[s->len - 2] == ',')
+    g_string_truncate (s, s->len - 2);
+  g_string_append (s, "\n    },\n");
+}
+
+/**
+ * serialize_nvenc_config_to_json:
+ * @params: a fully-populated NV_ENC_INITIALIZE_PARAMS (encodeConfig must be set)
+ *
+ * Returns: (transfer full): a heap-allocated JSON string, or %NULL on error.
+ *   Free with g_free().
+ */
+static gchar *
+serialize_nvenc_config_to_json (const NV_ENC_INITIALIZE_PARAMS * params)
+{
+  g_return_val_if_fail (params != NULL, NULL);
+  g_return_val_if_fail (params->encodeConfig != NULL, NULL);
+
+  const NV_ENC_CONFIG *cfg = params->encodeConfig;
+  const NV_ENC_RC_PARAMS *rc = &cfg->rcParams;
+  GString *s = g_string_new ("{\n");
+
+  /* ---- NV_ENC_INITIALIZE_PARAMS ---- */
+  json_open_obj (s, "initializeParams");
+  {
+    gchar *guid;
+    guid = guid_to_string (&params->encodeGUID);
+    json_append_string (s, "encodeGUID", guid);
+    g_free (guid);
+
+    guid = guid_to_string (&params->presetGUID);
+    json_append_string (s, "presetGUID", guid);
+    g_free (guid);
+
+    json_append_uint (s, "encodeWidth", params->encodeWidth);
+    json_append_uint (s, "encodeHeight", params->encodeHeight);
+    json_append_uint (s, "darWidth", params->darWidth);
+    json_append_uint (s, "darHeight", params->darHeight);
+    json_append_uint (s, "frameRateNum", params->frameRateNum);
+    json_append_uint (s, "frameRateDen", params->frameRateDen);
+    json_append_uint (s, "enableEncodeAsync", params->enableEncodeAsync);
+    json_append_uint (s, "enablePTD", params->enablePTD);
+    json_append_int  (s, "tuningInfo", (gint) params->tuningInfo);
+    json_append_uint (s, "enableWeightedPrediction",
+        params->enableWeightedPrediction);
+    json_append_uint (s, "enableOutputInVidmem", params->enableOutputInVidmem);
+    json_append_uint (s, "maxEncodeWidth", params->maxEncodeWidth);
+    json_append_uint (s, "maxEncodeHeight", params->maxEncodeHeight);
+    json_append_uint (s, "enableUniDirectionalB",
+        params->enableUniDirectionalB);
+    json_append_uint (s, "splitEncodeMode", params->splitEncodeMode);
+  }
+  json_close_obj (s);
+
+  /* ---- NV_ENC_CONFIG ---- */
+  json_open_obj (s, "encodeConfig");
+  {
+    gchar *guid = guid_to_string (&cfg->profileGUID);
+    json_append_string (s, "profileGUID", guid);
+    g_free (guid);
+
+    json_append_uint (s, "gopLength", cfg->gopLength);
+    json_append_int  (s, "frameIntervalP", cfg->frameIntervalP);
+    json_append_uint (s, "monoChromeEncoding", cfg->monoChromeEncoding);
+
+    /* ---- rcParams ---- */
+    json_open_obj (s, "rcParams");
+    {
+      json_append_int  (s, "rateControlMode", (gint) rc->rateControlMode);
+      json_append_uint (s, "averageBitRate", rc->averageBitRate);
+      json_append_uint (s, "maxBitRate", rc->maxBitRate);
+      json_append_uint (s, "vbvBufferSize", rc->vbvBufferSize);
+      json_append_uint (s, "vbvInitialDelay", rc->vbvInitialDelay);
+      json_append_bool (s, "enableMinQP", rc->enableMinQP);
+      json_append_bool (s, "enableMaxQP", rc->enableMaxQP);
+      json_append_bool (s, "enableInitialRCQP", rc->enableInitialRCQP);
+      json_append_bool (s, "enableAQ", rc->enableAQ);
+      json_append_bool (s, "enableTemporalAQ", rc->enableTemporalAQ);
+      json_append_bool (s, "enableLookahead", rc->enableLookahead);
+      json_append_uint (s, "lookaheadDepth", rc->lookaheadDepth);
+      json_append_bool (s, "enableNonRefP", rc->enableNonRefP);
+      json_append_bool (s, "strictGOPTarget", rc->strictGOPTarget);
+      json_append_bool (s, "zeroReorderDelay", rc->zeroReorderDelay);
+      json_append_uint (s, "aqStrength", rc->aqStrength);
+      json_append_qp   (s, "constQP", &rc->constQP);
+      json_append_qp   (s, "minQP", &rc->minQP);
+      json_append_qp   (s, "maxQP", &rc->maxQP);
+      json_append_qp   (s, "initialRCQP", &rc->initialRCQP);
+      json_append_uint (s, "targetQuality", rc->targetQuality);
+      json_append_int  (s, "multiPass", (gint) rc->multiPass);
+      json_append_uint (s, "lowDelayKeyFrameScale",
+          rc->lowDelayKeyFrameScale);
+    }
+    json_close_obj (s);
+
+    /* ---- codec-specific config ---- */
+    if (is_equal_guid (params->encodeGUID, NV_ENC_CODEC_H264_GUID)) {
+      const NV_ENC_CONFIG_H264 *h = &cfg->encodeCodecConfig.h264Config;
+      json_open_obj (s, "h264Config");
+      {
+        json_append_uint (s, "level", h->level);
+        json_append_uint (s, "idrPeriod", h->idrPeriod);
+        json_append_int  (s, "entropyCodingMode",
+            (gint) h->entropyCodingMode);
+        json_append_bool (s, "outputAUD", h->outputAUD);
+        json_append_bool (s, "repeatSPSPPS", h->repeatSPSPPS);
+        json_append_bool (s, "enableIntraRefresh", h->enableIntraRefresh);
+        json_append_uint (s, "intraRefreshPeriod", h->intraRefreshPeriod);
+        json_append_uint (s, "intraRefreshCnt", h->intraRefreshCnt);
+        json_append_uint (s, "maxNumRefFrames", h->maxNumRefFrames);
+        json_append_uint (s, "sliceMode", h->sliceMode);
+        json_append_uint (s, "sliceModeData", h->sliceModeData);
+        json_append_int  (s, "numRefL0", (gint) h->numRefL0);
+        json_append_int  (s, "numRefL1", (gint) h->numRefL1);
+        json_append_bool (s, "enableLTR", h->enableLTR);
+        json_append_uint (s, "ltrNumFrames", h->ltrNumFrames);
+        json_append_uint (s, "ltrTrustMode", h->ltrTrustMode);
+        json_append_int  (s, "adaptiveTransformMode",
+            (gint) h->adaptiveTransformMode);
+        json_append_int  (s, "fmoMode", (gint) h->fmoMode);
+        json_append_int  (s, "bdirectMode", (gint) h->bdirectMode);
+        json_append_bool (s, "disableSPSPPS", h->disableSPSPPS);
+        json_append_uint (s, "chromaFormatIDC", h->chromaFormatIDC);
+        json_append_bool (s, "enableTemporalSVC", h->enableTemporalSVC);
+        json_append_uint (s, "numTemporalLayers", h->numTemporalLayers);
+        json_append_uint (s, "maxTemporalLayers", h->maxTemporalLayers);
+        json_append_int  (s, "useBFramesAsRef",
+            (gint) h->useBFramesAsRef);
+        json_append_bool (s, "enableFillerDataInsertion",
+            h->enableFillerDataInsertion);
+        json_append_bool (s, "enableConstrainedEncoding",
+            h->enableConstrainedEncoding);
+        json_append_bool (s, "hierarchicalPFrames", h->hierarchicalPFrames);
+        json_append_bool (s, "hierarchicalBFrames", h->hierarchicalBFrames);
+        json_append_uint (s, "separateColourPlaneFlag",
+            h->separateColourPlaneFlag);
+        json_append_bool (s, "enableVFR", h->enableVFR);
+      }
+      json_close_obj (s);
+
+    } else if (is_equal_guid (params->encodeGUID, NV_ENC_CODEC_HEVC_GUID)) {
+      const NV_ENC_CONFIG_HEVC *h = &cfg->encodeCodecConfig.hevcConfig;
+      json_open_obj (s, "hevcConfig");
+      {
+        json_append_uint (s, "level", h->level);
+        json_append_uint (s, "tier", h->tier);
+        json_append_uint (s, "idrPeriod", h->idrPeriod);
+        json_append_bool (s, "outputAUD", h->outputAUD);
+        json_append_bool (s, "repeatSPSPPS", h->repeatSPSPPS);
+        json_append_bool (s, "enableIntraRefresh", h->enableIntraRefresh);
+        json_append_uint (s, "intraRefreshPeriod", h->intraRefreshPeriod);
+        json_append_uint (s, "intraRefreshCnt", h->intraRefreshCnt);
+        json_append_uint (s, "maxNumRefFramesInDPB",
+            h->maxNumRefFramesInDPB);
+        json_append_bool (s, "enableLTR", h->enableLTR);
+        json_append_uint (s, "ltrNumFrames", h->ltrNumFrames);
+        json_append_uint (s, "ltrTrustMode", h->ltrTrustMode);
+        json_append_uint (s, "sliceMode", h->sliceMode);
+        json_append_uint (s, "sliceModeData", h->sliceModeData);
+        json_append_uint (s, "maxTemporalLayersMinus1",
+            h->maxTemporalLayersMinus1);
+        json_append_int  (s, "numRefL0", (gint) h->numRefL0);
+        json_append_int  (s, "numRefL1", (gint) h->numRefL1);
+        json_append_int  (s, "useBFramesAsRef",
+            (gint) h->useBFramesAsRef);
+        json_append_bool (s, "enableFillerDataInsertion",
+            h->enableFillerDataInsertion);
+        json_append_bool (s, "enableConstrainedEncoding",
+            h->enableConstrainedEncoding);
+        json_append_bool (s, "enableTemporalSVC", h->enableTemporalSVC);
+        json_append_uint (s, "chromaFormatIDC", h->chromaFormatIDC);
+      }
+      json_close_obj (s);
+
+    } else if (is_equal_guid (params->encodeGUID, NV_ENC_CODEC_AV1_GUID)) {
+      const NV_ENC_CONFIG_AV1 *a = &cfg->encodeCodecConfig.av1Config;
+      json_open_obj (s, "av1Config");
+      {
+        json_append_uint (s, "level", a->level);
+        json_append_uint (s, "tier", a->tier);
+        json_append_uint (s, "idrPeriod", a->idrPeriod);
+        json_append_bool (s, "enableIntraRefresh", a->enableIntraRefresh);
+        json_append_uint (s, "intraRefreshPeriod", a->intraRefreshPeriod);
+        json_append_uint (s, "intraRefreshCnt", a->intraRefreshCnt);
+        json_append_uint (s, "maxNumRefFramesInDPB",
+            a->maxNumRefFramesInDPB);
+        json_append_uint (s, "maxTemporalLayersMinus1",
+            a->maxTemporalLayersMinus1);
+        json_append_bool (s, "enableLTR", a->enableLTR);
+        json_append_uint (s, "ltrNumFrames", a->ltrNumFrames);
+        json_append_bool (s, "enableTemporalSVC", a->enableTemporalSVC);
+        json_append_uint (s, "numTemporalLayers", a->numTemporalLayers);
+        json_append_uint (s, "numTileColumns", a->numTileColumns);
+        json_append_uint (s, "numTileRows", a->numTileRows);
+        json_append_bool (s, "repeatSeqHdr", a->repeatSeqHdr);
+        json_append_uint (s, "chromaFormatIDC", a->chromaFormatIDC);
+        json_append_int  (s, "numFwdRefs", (gint) a->numFwdRefs);
+        json_append_int  (s, "numBwdRefs", (gint) a->numBwdRefs);
+        json_append_int  (s, "useBFramesAsRef",
+            (gint) a->useBFramesAsRef);
+      }
+      json_close_obj (s);
+    }
+  }
+  json_close_obj (s);
+
+  /* remove final trailing comma from top-level object */
+  if (s->len >= 2 && s->str[s->len - 2] == ',')
+    g_string_truncate (s, s->len - 2);
+  g_string_append (s, "\n}\n");
+
+  return g_string_free (s, FALSE);
+}
+
+static void
+gst_nv_encoder_update_min_pts (GstNvEncoder * self)
+{
+  GstNvEncoderPrivate *priv = self->priv;
+  GstClockTime min_pts = priv->preserve_input_pts ?
+      GST_CLOCK_TIME_NONE : DEFAULT_MIN_PTS;
+
+  /* GstVideoEncoder may shift timestamps to satisfy min_pts. Keep it disabled
+   * when the caller requests strict input->output PTS preservation. */
+  gst_video_encoder_set_min_pts (GST_VIDEO_ENCODER (self), min_pts);
+}
 
 static void
 gst_nv_encoder_class_init (GstNvEncoderClass * klass)
@@ -211,6 +508,25 @@ gst_nv_encoder_class_init (GstNvEncoderClass * klass)
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
               GST_PARAM_MUTABLE_READY)));
 
+  /**
+   * GstNvEncoder:preserve-input-pts:
+   *
+   * If %TRUE, output PTS is forced to match input buffer PTS and
+   * GstVideoEncoder min-PTS shifting is disabled.
+   *
+   * Since: 1.26
+   */
+  g_object_class_install_property (object_class, PROP_PRESERVE_INPUT_PTS,
+      g_param_spec_boolean ("preserve-input-pts", "Preserve Input PTS",
+          "Force output PTS to match input buffer PTS and disable min-PTS shift",
+          DEFAULT_PRESERVE_INPUT_PTS,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+              GST_PARAM_MUTABLE_READY)));
+
+  g_object_class_install_property (object_class, PROP_CONFIG_JSON,
+      g_param_spec_string ("encoder-config-json", "Encoder Config JSON",
+          "JSON dump of NVENC config (available after PLAYING)",
+          NULL, (GParamFlags) (G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
 
   element_class->set_context = GST_DEBUG_FUNCPTR (gst_nv_encoder_set_context);
 
@@ -249,8 +565,7 @@ gst_nv_encoder_init (GstNvEncoder * self)
 {
   self->priv = new GstNvEncoderPrivate ();
 
-  gst_video_encoder_set_min_pts (GST_VIDEO_ENCODER (self),
-      GST_SECOND * 60 * 60 * 1000);
+  gst_nv_encoder_update_min_pts (self);
   GST_PAD_SET_ACCEPT_INTERSECT (GST_VIDEO_ENCODER_SINK_PAD (self));
 }
 
@@ -300,6 +615,10 @@ gst_nv_encoder_set_property (GObject * object, guint prop_id,
         }
       }
       break;
+    case PROP_PRESERVE_INPUT_PTS:
+      priv->preserve_input_pts = g_value_get_boolean (value);
+      gst_nv_encoder_update_min_pts (self);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -319,6 +638,12 @@ gst_nv_encoder_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_EXTERN_POOL:
       g_value_set_object (value, priv->extern_pool);
+      break;
+    case PROP_PRESERVE_INPUT_PTS:
+      g_value_set_boolean (value, priv->preserve_input_pts);
+      break;
+    case PROP_CONFIG_JSON:
+      g_value_set_string (value, priv->config_json);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -991,8 +1316,24 @@ gst_nv_encoder_thread_func (GstNvEncoder * self)
     if (bitstream.pictureType == NV_ENC_PIC_TYPE_IDR)
       GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
 
-    frame->dts = frame->pts - priv->dts_offset;
-    frame->pts = bitstream.outputTimeStamp;
+    GstClockTime output_pts = bitstream.outputTimeStamp;
+    if (priv->preserve_input_pts && frame->input_buffer) {
+      GstClockTime input_pts = GST_BUFFER_PTS (frame->input_buffer);
+
+      /* Use the source buffer timestamp when requested so downstream sees
+       * identical PTS values even if encoder internals reorder frames. */
+      if (GST_CLOCK_TIME_IS_VALID (input_pts))
+        output_pts = input_pts;
+    }
+
+    frame->pts = output_pts;
+    if (GST_CLOCK_TIME_IS_VALID (output_pts) && output_pts >= priv->dts_offset) {
+      frame->dts = output_pts - priv->dts_offset;
+    } else {
+      /* Preserve-input-pts can bring early timestamps close to zero; avoid
+       * wrapping to huge unsigned values when DTS would be negative. */
+      frame->dts = GST_CLOCK_TIME_NONE;
+    }
     frame->duration = bitstream.outputDuration;
 
     gst_nv_enc_task_unlock_bitstream (task);
@@ -1168,6 +1509,9 @@ gst_nv_encoder_init_session (GstNvEncoder * self, GstBuffer * in_buf)
 
   memset (&priv->init_params, 0, sizeof (NV_ENC_INITIALIZE_PARAMS));
   memset (&priv->config, 0, sizeof (NV_ENC_CONFIG));
+  priv->ptd_abs_frame_idx = 0;
+  priv->ptd_gop_frame_idx = 0;
+  priv->ptd_warned_layer_fallback = FALSE;
 
   if (priv->selected_device_mode == GST_NV_ENCODER_DEVICE_AUTO_SELECT) {
     GstNvEncoderDeviceData data;
@@ -1257,6 +1601,11 @@ gst_nv_encoder_init_session (GstNvEncoder * self, GstBuffer * in_buf)
       &priv->config);
 
   priv->init_params.encodeConfig = &priv->config;
+
+  g_free (priv->config_json);
+  priv->config_json = serialize_nvenc_config_to_json (&priv->init_params);
+  GST_INFO_OBJECT (self, "NVENC config JSON:\n%s", priv->config_json);
+
   status = priv->object->InitSession (&priv->init_params,
       priv->stream, &priv->input_state->info, task_pool_size);
   if (!gst_nv_enc_result (status, self)) {
@@ -2152,6 +2501,161 @@ gst_nv_encoder_foreach_caption_meta (GstBuffer * buffer, GstMeta ** meta,
   return TRUE;
 }
 
+static gboolean
+gst_nv_encoder_get_h264_parser_ptd_decision (GstNvEncoder * self,
+    GstVideoCodecFrame * frame, GstNvEncH264PtdDecision * decision)
+{
+  GstBuffer *in_buf;
+  GstCustomMeta *meta;
+  GstStructure *s;
+  gboolean is_idr = FALSE;
+  guint slice_type = GST_H264_P_SLICE;
+  guint ref_pic_flag = 1;
+  guint temporal_id = 0;
+  gint display_poc = 0;
+
+  g_return_val_if_fail (decision != NULL, FALSE);
+
+  if (frame == NULL || frame->input_buffer == NULL)
+    return FALSE;
+
+  in_buf = frame->input_buffer;
+  meta = gst_buffer_get_custom_meta (in_buf, GST_H264_TEMPORAL_META_NAME);
+  if (meta == NULL)
+    return FALSE;
+
+  s = gst_custom_meta_get_structure (meta);
+  if (s == NULL)
+    return FALSE;
+
+  gst_structure_get_boolean (s, "is-idr", &is_idr);
+  gst_structure_get_uint (s, "slice-type", &slice_type);
+  gst_structure_get_uint (s, "ref-pic-flag", &ref_pic_flag);
+  gst_structure_get_uint (s, "temporal-id", &temporal_id);
+  gst_structure_get_int (s, "display-poc", &display_poc);
+
+  decision->valid = TRUE;
+  if (is_idr) {
+    decision->picture_type = NV_ENC_PIC_TYPE_IDR;
+    decision->encode_pic_flags |= NV_ENC_PIC_FLAG_FORCEIDR;
+    if (self->priv->config.encodeCodecConfig.h264Config.repeatSPSPPS)
+      decision->encode_pic_flags |= NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+  } else if ((slice_type % 5) == GST_H264_I_SLICE ||
+      (slice_type % 5) == GST_H264_SI_SLICE) {
+    decision->picture_type = NV_ENC_PIC_TYPE_I;
+  } else if ((slice_type % 5) == GST_H264_B_SLICE) {
+    decision->picture_type = NV_ENC_PIC_TYPE_B;
+  } else {
+    decision->picture_type = NV_ENC_PIC_TYPE_P;
+  }
+
+  decision->display_poc_syntax = display_poc >= 0 ? (guint32) display_poc : 0;
+  decision->ref_pic_flag = ref_pic_flag ? 1 : 0;
+  decision->temporal_layer = temporal_id;
+
+  GST_LOG_OBJECT (self,
+      "Using parser PTD decision frame=%u type=%d ref=%u poc=%d tl=%u",
+      frame->system_frame_number, (gint) decision->picture_type,
+      decision->ref_pic_flag, display_poc, decision->temporal_layer);
+
+  return TRUE;
+}
+
+static void
+gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
+    GstVideoCodecFrame * frame, GstNvEncTask * task)
+{
+  GstNvEncoderPrivate *priv = self->priv;
+  GstNvEncH264PtdDecision decision =
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0 };
+  const NV_ENC_CONFIG_H264 *h264;
+  gboolean is_idr;
+  gboolean gop_boundary = FALSE;
+  gboolean use_l1t4 = FALSE;
+  guint temporal_layer = 0;
+  guint ref_pic_flag = 1;
+  guint64 display_poc;
+
+  if (!is_equal_guid (priv->init_params.encodeGUID, NV_ENC_CODEC_H264_GUID))
+    return;
+
+  if (priv->init_params.enablePTD != 0)
+    return;
+
+  if (gst_nv_encoder_get_h264_parser_ptd_decision (self, frame, &decision)) {
+    gst_nv_enc_task_set_h264_ptd_decision (task, &decision);
+
+    priv->ptd_abs_frame_idx++;
+    if (decision.picture_type == NV_ENC_PIC_TYPE_IDR)
+      priv->ptd_gop_frame_idx = 1;
+    else
+      priv->ptd_gop_frame_idx++;
+
+    return;
+  }
+
+  h264 = &priv->config.encodeCodecConfig.h264Config;
+
+  if (priv->config.gopLength > 0 &&
+      priv->config.gopLength != NVENC_INFINITE_GOPLENGTH &&
+      priv->ptd_gop_frame_idx >= priv->config.gopLength) {
+    gop_boundary = TRUE;
+  }
+
+  is_idr = GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame) ||
+      priv->ptd_abs_frame_idx == 0 || gop_boundary;
+
+  if (!is_idr && h264->enableTemporalSVC) {
+    if (h264->numTemporalLayers >= 4) {
+      static const guint l1t4_tid[] = { 0, 3, 2, 3, 1, 3, 2, 3 };
+      static const guint l1t4_ref[] = { 1, 0, 1, 0, 1, 0, 1, 0 };
+      guint pattern_idx = (guint) (priv->ptd_gop_frame_idx %
+          G_N_ELEMENTS (l1t4_tid));
+
+      temporal_layer = l1t4_tid[pattern_idx];
+      ref_pic_flag = l1t4_ref[pattern_idx];
+      use_l1t4 = TRUE;
+    } else if (h264->numTemporalLayers > 1 &&
+        !priv->ptd_warned_layer_fallback) {
+      GST_INFO_OBJECT (self,
+          "PTD-disabled decision only has explicit L1T1/L1T4 policy; "
+          "falling back to L1T1 for numTemporalLayers=%u",
+          h264->numTemporalLayers);
+      priv->ptd_warned_layer_fallback = TRUE;
+    }
+  }
+
+  decision.valid = TRUE;
+  decision.picture_type = is_idr ? NV_ENC_PIC_TYPE_IDR : NV_ENC_PIC_TYPE_P;
+
+  display_poc = MIN (priv->ptd_abs_frame_idx, (guint64) G_MAXUINT32);
+  decision.display_poc_syntax = (guint32) display_poc;
+  decision.ref_pic_flag = is_idr ? 1 : ref_pic_flag;
+  decision.temporal_layer = is_idr ? 0 : temporal_layer;
+
+  if (is_idr) {
+    decision.encode_pic_flags |= NV_ENC_PIC_FLAG_FORCEIDR;
+    if (h264->repeatSPSPPS)
+      decision.encode_pic_flags |= NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+  }
+
+  gst_nv_enc_task_set_h264_ptd_decision (task, &decision);
+
+  GST_LOG_OBJECT (self,
+      "PTD decision frame=%u abs=%" G_GUINT64_FORMAT " gop=%" G_GUINT64_FORMAT
+      " type=%d ref=%u tl=%u mode=%s flags=0x%x",
+      frame->system_frame_number, priv->ptd_abs_frame_idx,
+      priv->ptd_gop_frame_idx, (gint) decision.picture_type,
+      decision.ref_pic_flag, decision.temporal_layer,
+      use_l1t4 ? "L1T4" : "L1T1", decision.encode_pic_flags);
+
+  priv->ptd_abs_frame_idx++;
+  if (is_idr)
+    priv->ptd_gop_frame_idx = 1;
+  else
+    priv->ptd_gop_frame_idx++;
+}
+
 static GstFlowReturn
 gst_nv_encoder_handle_frame (GstVideoEncoder * encoder,
     GstVideoCodecFrame * frame)
@@ -2241,6 +2745,17 @@ gst_nv_encoder_handle_frame (GstVideoEncoder * encoder,
         (GstBufferForeachMetaFunc) gst_nv_encoder_foreach_caption_meta,
         gst_nv_enc_task_get_sei_payload (task));
   }
+
+  if (priv->preserve_input_pts) {
+    GstClockTime input_pts = GST_BUFFER_PTS (in_buf);
+
+    /* GstVideoEncoder may have adjusted frame->pts to satisfy min_pts.
+     * Restore the input buffer PTS so NVENC inputTimeStamp carries source time. */
+    if (GST_CLOCK_TIME_IS_VALID (input_pts))
+      frame->pts = input_pts;
+  }
+
+  gst_nv_encoder_prepare_h264_ptd_decision (self, frame, task);
 
   status = priv->object->Encode (frame,
       gst_nv_encoder_get_pic_struct (self, in_buf), task);

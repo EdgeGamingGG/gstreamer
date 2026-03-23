@@ -223,8 +223,25 @@ gst_h264_parse_nalu_header (GstH264NalUnit * nalu)
 
       svc_extension_flag = gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
       if (svc_extension_flag) { /* SVC */
+        GstH264NalUnitExtensionSVC *const svc = &nalu->extension.svc;
 
         nalu->extension_type = GST_H264_NAL_EXTENSION_SVC;
+        svc->idr_flag = gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
+        svc->priority_id = gst_bit_reader_get_bits_uint8_unchecked (&br, 6);
+        svc->no_inter_layer_pred_flag =
+            gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
+        svc->dependency_id = gst_bit_reader_get_bits_uint8_unchecked (&br, 3);
+        svc->quality_id = gst_bit_reader_get_bits_uint8_unchecked (&br, 4);
+        svc->temporal_id = gst_bit_reader_get_bits_uint8_unchecked (&br, 3);
+        svc->use_ref_base_pic_flag =
+            gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
+        svc->discardable_flag = gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
+        svc->output_flag = gst_bit_reader_get_bits_uint8_unchecked (&br, 1);
+        svc->reserved_three_2bits =
+            gst_bit_reader_get_bits_uint8_unchecked (&br, 2);
+
+        /* Update IdrPicFlag (G.7.4.1.1) */
+        nalu->idr_pic_flag = svc->idr_flag;
 
       } else {                  /* MVC */
         GstH264NalUnitExtensionMVC *const mvc = &nalu->extension.mvc;
@@ -1861,6 +1878,9 @@ gst_h264_parser_parse_sps (GstH264NalParser * nalparser, GstH264NalUnit * nalu,
   GstH264ParserResult res = gst_h264_parse_sps (nalu, sps);
 
   if (res == GST_H264_PARSER_OK) {
+    if (nalparser->temporal_sps_fixup && sps->num_ref_frames == 3)
+      sps->num_ref_frames = 5;
+
     GST_DEBUG ("adding sequence parameter set with id: %d to array", sps->id);
 
     if (!gst_h264_sps_copy (&nalparser->sps[sps->id], sps))
@@ -2178,6 +2198,9 @@ gst_h264_parser_parse_subset_sps (GstH264NalParser * nalparser,
 
   res = gst_h264_parse_subset_sps (nalu, sps);
   if (res == GST_H264_PARSER_OK) {
+    if (nalparser->temporal_sps_fixup && sps->num_ref_frames == 3)
+      sps->num_ref_frames = 5;
+
     GST_DEBUG ("adding sequence parameter set with id: %d to array", sps->id);
 
     if (!gst_h264_sps_copy (&nalparser->sps[sps->id], sps)) {
@@ -2477,8 +2500,11 @@ gst_h264_parser_parse_slice_hdr (GstH264NalParser * nalparser,
     return GST_H264_PARSER_BROKEN_LINK;
   }
 
-  /* Check we can actually parse this slice (AVC, MVC headers only) */
-  if (sps->extension_type && sps->extension_type != GST_H264_NAL_EXTENSION_MVC) {
+  /* Check we can actually parse this slice. The parser handles AVC, MVC, and
+   * SVC extension NAL units. Other extension types remain unsupported. */
+  if (sps->extension_type &&
+      sps->extension_type != GST_H264_NAL_EXTENSION_MVC &&
+      sps->extension_type != GST_H264_NAL_EXTENSION_SVC) {
     GST_WARNING ("failed to parse unsupported slice header");
     return GST_H264_PARSER_BROKEN_DATA;
   }
@@ -2613,6 +2639,1801 @@ error:
   GST_WARNING ("error parsing \"Slice header\"");
   return GST_H264_PARSER_ERROR;
 }
+
+// Alex: too much details:
+typedef struct
+{
+  gint low;
+  gint range;
+  const guint8 *bytestream_start;
+  const guint8 *bytestream;
+  const guint8 *bytestream_end;
+} GstH264CabacContext;
+
+/* FFmpeg-derived H.264 CABAC tables. This minimal parser-side port currently
+ * only uses them for exact all-skip detection in CABAC P/SP slices. */
+static const guint8 gst_h264_ff_cabac_lps_range[512] = {
+  128, 128, 128, 128, 128, 128, 123, 123, 116, 116, 111, 111, 105, 105, 100,
+  100, 95, 95, 90, 90, 85, 85, 81, 81, 77, 77, 73, 73, 69, 69, 66, 66, 62, 62,
+  59, 59, 56, 56, 53, 53, 51, 51, 48, 48, 46, 46, 43, 43, 41, 41, 39, 39, 37,
+  37, 35, 35, 33, 33, 32, 32, 30, 30, 29, 29, 27, 27, 26, 26, 24, 24, 23, 23,
+  22, 22, 21, 21, 20, 20, 19, 19, 18, 18, 17, 17, 16, 16, 15, 15, 14, 14, 14,
+  14, 13, 13, 12, 12, 12, 12, 11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9, 8, 8,
+  8, 8, 7, 7, 7, 7, 7, 7, 6, 6, 6, 6, 6, 6, 2, 2, 176, 176, 167, 167, 158, 158,
+  150, 150, 142, 142, 135, 135, 128, 128, 122, 122, 116, 116, 110, 110, 104,
+  104, 99, 99, 94, 94, 89, 89, 85, 85, 80, 80, 76, 76, 72, 72, 69, 69, 65, 65,
+  62, 62, 59, 59, 56, 56, 53, 53, 50, 50, 48, 48, 45, 45, 43, 43, 41, 41, 39,
+  39, 37, 37, 35, 35, 33, 33, 31, 31, 30, 30, 28, 28, 27, 27, 26, 26, 24, 24,
+  23, 23, 22, 22, 21, 21, 20, 20, 19, 19, 18, 18, 17, 17, 16, 16, 15, 15, 14,
+  14, 14, 14, 13, 13, 12, 12, 12, 12, 11, 11, 11, 11, 10, 10, 9, 9, 9, 9, 9, 9,
+  8, 8, 8, 8, 7, 7, 7, 7, 2, 2, 208, 208, 197, 197, 187, 187, 178, 178, 169,
+  169, 160, 160, 152, 152, 144, 144, 137, 137, 130, 130, 123, 123, 117, 117,
+  111, 111, 105, 105, 100, 100, 95, 95, 90, 90, 86, 86, 81, 81, 77, 77, 73, 73,
+  69, 69, 66, 66, 63, 63, 59, 59, 56, 56, 54, 54, 51, 51, 48, 48, 46, 46, 43,
+  43, 41, 41, 39, 39, 37, 37, 35, 35, 33, 33, 32, 32, 30, 30, 29, 29, 27, 27,
+  26, 26, 25, 25, 23, 23, 22, 22, 21, 21, 20, 20, 19, 19, 18, 18, 17, 17, 16,
+  16, 15, 15, 15, 15, 14, 14, 13, 13, 12, 12, 12, 12, 11, 11, 11, 11, 10, 10,
+  10, 10, 9, 9, 9, 9, 8, 8, 2, 2, 240, 240, 227, 227, 216, 216, 205, 205, 195,
+  195, 185, 185, 175, 175, 166, 166, 158, 158, 150, 150, 142, 142, 135, 135,
+  128, 128, 122, 122, 116, 116, 110, 110, 104, 104, 99, 99, 94, 94, 89, 89, 85,
+  85, 80, 80, 76, 76, 72, 72, 69, 69, 65, 65, 62, 62, 59, 59, 56, 56, 53, 53,
+  50, 50, 48, 48, 45, 45, 43, 43, 41, 41, 39, 39, 37, 37, 35, 35, 33, 33, 31,
+  31, 30, 30, 28, 28, 27, 27, 25, 25, 24, 24, 23, 23, 22, 22, 21, 21, 20, 20,
+  19, 19, 18, 18, 17, 17, 16, 16, 15, 15, 14, 14, 14, 14, 13, 13, 12, 12, 12,
+  12, 11, 11, 11, 11, 10, 10, 9, 9, 2, 2
+};
+
+static const guint8 gst_h264_ff_cabac_mlps_state[256] = {
+  127, 126, 77, 76, 77, 76, 75, 74, 75, 74, 75, 74, 73, 72, 73, 72, 73, 72, 71,
+  70, 71, 70, 71, 70, 69, 68, 69, 68, 67, 66, 67, 66, 67, 66, 65, 64, 65, 64,
+  63, 62, 61, 60, 61, 60, 61, 60, 59, 58, 59, 58, 57, 56, 55, 54, 55, 54, 53,
+  52, 53, 52, 51, 50, 49, 48, 49, 48, 47, 46, 45, 44, 45, 44, 43, 42, 43, 42,
+  39, 38, 39, 38, 37, 36, 37, 36, 33, 32, 33, 32, 31, 30, 31, 30, 27, 26, 27,
+  26, 25, 24, 23, 22, 23, 22, 19, 18, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9,
+  8, 9, 8, 5, 4, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+  13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+  32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+  51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+  70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88,
+  89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
+  107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121,
+  122, 123, 124, 125, 124, 125, 126, 127
+};
+
+static const gint8 gst_h264_p_skip_cabac_init[3][2] = {
+  {23, 33},
+  {22, 25},
+  {29, 16}
+};
+
+static const gint8 gst_h264_p_mb_type_cabac_init[3][7][2] = {
+  {
+        { 1, 9}, { 0, 49}, {-37, 118}, { 5, 57},
+        {12, 49}, {-4, 73}, {17, 50}
+      },
+  {
+        {-2, 9}, { 4, 41}, {-29, 118}, { 2, 65},
+        { 9, 50}, {-3, 70}, {10, 54}
+      },
+  {
+        {-10, 51}, {-3, 62}, {-27, 99}, {26, 16},
+        { 6, 57}, {-17, 73}, {14, 57}
+      }
+};
+
+static const gint8 gst_h264_p_mvd_cabac_init[3][8][2] = {
+  {
+        {-3, 69}, {-6, 81}, {-11, 96}, { 6, 55},
+        {-3, 76}, {-10, 94}, { 5, 54}, { 4, 69}
+      },
+  {
+        {-2, 69}, {-5, 82}, {-10, 96}, { 2, 59},
+        {-3, 74}, { -6, 85}, { 0, 59}, {-3, 81}
+      },
+  {
+        {-11, 89}, {-15, 103}, {-21, 116}, {19, 57},
+        { -5, 85}, {-13, 106}, { 5, 63}, { 6, 75}
+      }
+};
+
+static const gint8 gst_h264_p_ref_cabac_init[3][6][2] = {
+  {
+        {-7, 67}, {-5, 74}, {-4, 74},
+        {-5, 80}, {-7, 72}, { 1, 58}
+      },
+  {
+        {-1, 66}, {-1, 77}, { 1, 70},
+        {-2, 86}, {-5, 72}, { 0, 61}
+      },
+  {
+        { 3, 55}, {-4, 79}, {-2, 75},
+        {-12, 97}, {-7, 50}, { 1, 60}
+      }
+};
+
+static const gint8 gst_h264_p_cbp_cabac_init[3][11][2] = {
+  {
+        {-27, 126}, {-28, 98}, {-25, 101}, {-23, 67}, {-28, 82},
+        {-20, 94}, {-16, 83}, {-22, 110}, {-21, 91}, {-18, 102},
+        {-13, 93}
+      },
+  {
+        {-39, 127}, {-18, 91}, {-17, 96}, {-26, 81}, {-35, 98},
+        {-24, 102}, {-23, 97}, {-27, 119}, {-24, 99}, {-21, 110},
+        {-18, 102}
+      },
+  {
+        {-36, 127}, {-17, 91}, {-14, 95}, {-25, 84}, {-25, 86},
+        {-12, 89}, {-17, 91}, {-31, 127}, {-14, 76}, {-18, 103},
+        {-13, 90}
+      }
+};
+
+static const gint8 gst_h264_p_qp_delta_cabac_init[3][4][2] = {
+  {
+        {0, 41}, {0, 63}, {0, 63}, {0, 63}
+      },
+  {
+        {0, 41}, {0, 63}, {0, 63}, {0, 63}
+      },
+  {
+        {0, 41}, {0, 63}, {0, 63}, {0, 63}
+      }
+};
+
+static const gint8 gst_h264_p_intra_chroma_pred_cabac_init[3][6][2] = {
+  {
+        {-9, 83}, {4, 86}, {0, 97}, {-7, 72}, {13, 41}, {3, 62}
+      },
+  {
+        {-9, 83}, {4, 86}, {0, 97}, {-7, 72}, {13, 41}, {3, 62}
+      },
+  {
+        {-9, 83}, {4, 86}, {0, 97}, {-7, 72}, {13, 41}, {3, 62}
+      }
+};
+
+static const gint8 gst_h264_p_residual_cbf_cabac_init[3][12][2] = {
+  {
+        {-3, 74}, {-9, 92}, {-8, 87}, {-23, 126}, {5, 54}, {6, 60},
+        {6, 59}, {6, 69}, {-1, 48}, {0, 68}, {-4, 69}, {-8, 88}
+      },
+  {
+        {-2, 73}, {-12, 104}, {-9, 91}, {-31, 127}, {3, 55}, {7, 56},
+        {7, 55}, {8, 61}, {-3, 53}, {0, 68}, {-7, 74}, {-9, 88}
+      },
+  {
+        {-5, 79}, {-11, 104}, {-11, 91}, {-30, 127}, {0, 65}, {-2, 79},
+        {0, 72}, {-4, 92}, {-6, 56}, {3, 68}, {-8, 71}, {-13, 98}
+      }
+};
+
+static const gint8 gst_h264_p_residual_sig_cabac_init[3][33][2] = {
+  {
+        {9, 53}, {2, 53}, {5, 53}, {-2, 61}, {0, 56}, {0, 56}, {-13, 63},
+        {-5, 60}, {-1, 62}, {4, 57}, {-6, 69}, {4, 57}, {14, 39}, {4, 51},
+        {13, 68}, {3, 64}, {1, 61}, {9, 63}, {7, 50}, {16, 39}, {5, 44},
+        {4, 52}, {11, 48}, {-5, 60}, {-1, 59}, {0, 59}, {22, 33}, {5, 44},
+        {14, 43}, {-1, 78}, {0, 60}, {9, 69}, {11, 28}
+      },
+  {
+        {0, 54}, {-5, 61}, {0, 58}, {-1, 60}, {-3, 61}, {-8, 67},
+        {-25, 84}, {-14, 74}, {-5, 65}, {5, 52}, {2, 57}, {0, 61},
+        {-9, 69}, {-11, 70}, {18, 55}, {-4, 71}, {0, 58}, {7, 61},
+        {9, 41}, {18, 25}, {9, 32}, {5, 43}, {9, 47}, {0, 44}, {0, 51},
+        {2, 46}, {19, 38}, {-4, 66}, {15, 38}, {12, 42}, {9, 34}, {0, 89},
+        {4, 45}
+      },
+  {
+        {1, 67}, {-15, 72}, {-5, 75}, {-8, 80}, {-21, 83}, {-21, 64},
+        {-13, 31}, {-25, 64}, {-29, 94}, {9, 75}, {17, 63}, {-8, 74},
+        {-5, 35}, {-2, 27}, {13, 91}, {3, 65}, {-7, 69}, {8, 77},
+        {-10, 66}, {3, 62}, {-3, 68}, {-20, 81}, {0, 30}, {1, 7},
+        {-3, 23}, {-21, 74}, {16, 66}, {-23, 124}, {17, 37}, {44, -18},
+        {50, -34}, {-22, 127}, {4, 39}
+      }
+};
+
+static const gint8 gst_h264_p_residual_last_cabac_init[3][33][2] = {
+  {
+        {25, 7}, {30, -7}, {28, 3}, {28, 4}, {32, 0}, {34, -1}, {30, 6},
+        {30, 6}, {32, 9}, {31, 19}, {26, 27}, {26, 30}, {37, 20}, {28, 34},
+        {17, 70}, {1, 67}, {5, 59}, {9, 67}, {16, 30}, {18, 32}, {18, 35},
+        {22, 29}, {24, 31}, {23, 38}, {18, 43}, {20, 41}, {11, 63}, {9, 59},
+        {9, 64}, {-1, 94}, {-2, 89}, {-9, 108}, {-6, 76}
+      },
+  {
+        {33, -25}, {34, -30}, {36, -28}, {38, -28}, {38, -27}, {34, -18},
+        {35, -16}, {34, -14}, {32, -8}, {37, -6}, {35, 0}, {30, 10},
+        {28, 18}, {26, 25}, {29, 41}, {0, 75}, {2, 72}, {8, 77}, {14, 35},
+        {18, 31}, {17, 35}, {21, 30}, {17, 45}, {20, 42}, {18, 45},
+        {27, 26}, {16, 54}, {7, 66}, {16, 56}, {11, 73}, {10, 67},
+        {-10, 116}, {-23, 112}
+      },
+  {
+        {35, -18}, {33, -25}, {28, -3}, {24, 10}, {27, 0}, {34, -14},
+        {52, -44}, {39, -24}, {19, 17}, {31, 25}, {36, 29}, {24, 33},
+        {34, 15}, {30, 20}, {22, 73}, {20, 34}, {19, 31}, {27, 44},
+        {19, 16}, {15, 36}, {15, 36}, {21, 28}, {25, 21}, {30, 20},
+        {31, 12}, {27, 16}, {24, 42}, {0, 93}, {14, 56}, {15, 57},
+        {26, 38}, {-24, 127}, {-24, 115}
+      }
+};
+
+static const gint8 gst_h264_p_residual_abs_cabac_init[3][29][2] = {
+  {
+        {1, 58}, {-3, 29}, {-1, 36}, {1, 38}, {2, 43}, {-6, 55}, {0, 58},
+        {0, 64}, {-3, 74}, {-10, 90}, {0, 70}, {-4, 29}, {5, 31}, {7, 42},
+        {1, 59}, {-2, 58}, {-3, 72}, {-3, 81}, {-11, 97}, {0, 58}, {8, 5},
+        {10, 14}, {14, 18}, {13, 27}, {2, 40}, {0, 58}, {-3, 70}, {-6, 79},
+        {-8, 85}
+      },
+  {
+        {-11, 76}, {-10, 44}, {-10, 52}, {-10, 57}, {-9, 58}, {-16, 72},
+        {-7, 69}, {-4, 69}, {-5, 74}, {-9, 86}, {2, 66}, {-9, 34}, {1, 32},
+        {11, 31}, {5, 52}, {-2, 55}, {-2, 67}, {0, 73}, {-8, 89}, {3, 52},
+        {7, 4}, {10, 8}, {17, 8}, {16, 19}, {3, 37}, {-1, 61}, {-5, 73},
+        {-1, 70}, {-4, 78}
+      },
+  {
+        {-10, 82}, {-8, 48}, {-8, 61}, {-8, 66}, {-7, 70}, {-14, 75},
+        {-10, 79}, {-9, 83}, {-12, 92}, {-18, 108}, {-4, 79}, {-22, 69},
+        {-16, 75}, {-2, 58}, {1, 58}, {-13, 78}, {-9, 83}, {-4, 81},
+        {-13, 99}, {-13, 81}, {-6, 38}, {-13, 62}, {-6, 58}, {-2, 59},
+        {-16, 73}, {-10, 76}, {-13, 86}, {-9, 83}, {-10, 87}
+      }
+};
+
+static const gint8 gst_h264_p_transform8x8_cabac_init[3][37][2] = {
+  {
+        {12, 40}, {11, 51}, {14, 59}, {-4, 79}, {-7, 71}, {-5, 69},
+        {-9, 70}, {-8, 66}, {-10, 68}, {-19, 73}, {-12, 69}, {-16, 70},
+        {-15, 67}, {-20, 62}, {-19, 70}, {-16, 66}, {-22, 65}, {-20, 63},
+        {9, -2}, {26, -9}, {33, -9}, {39, -7}, {41, -2}, {45, 3}, {49, 9},
+        {45, 27}, {36, 59}, {-6, 66}, {-7, 35}, {-7, 42}, {-8, 45},
+        {-5, 48}, {-12, 56}, {-6, 60}, {-5, 62}, {-8, 66}, {-8, 76}
+      },
+  {
+        {25, 32}, {21, 49}, {21, 54}, {-5, 85}, {-6, 81}, {-10, 77},
+        {-7, 81}, {-17, 80}, {-18, 73}, {-4, 74}, {-10, 83}, {-9, 71},
+        {-9, 67}, {-1, 61}, {-8, 66}, {-14, 66}, {0, 59}, {2, 59},
+        {17, -10}, {32, -13}, {42, -9}, {49, -5}, {53, 0}, {64, 3},
+        {68, 10}, {66, 27}, {47, 57}, {-5, 71}, {0, 24}, {-1, 36},
+        {-2, 42}, {-2, 52}, {-9, 57}, {-6, 63}, {-4, 65}, {-4, 67},
+        {-7, 82}
+      },
+  {
+        {21, 33}, {19, 50}, {17, 61}, {-3, 78}, {-8, 74}, {-9, 72},
+        {-10, 72}, {-18, 75}, {-12, 71}, {-11, 63}, {-5, 70}, {-17, 75},
+        {-14, 72}, {-16, 67}, {-8, 53}, {-14, 59}, {-9, 52}, {-11, 68},
+        {9, -2}, {30, -10}, {31, -4}, {33, -1}, {33, 7}, {31, 12},
+        {37, 23}, {31, 38}, {20, 64}, {-9, 71}, {-7, 37}, {-8, 44},
+        {-11, 49}, {-10, 56}, {-12, 59}, {-8, 63}, {-9, 67}, {-6, 68},
+        {-10, 79}
+      }
+};
+
+static const guint8 gst_h264_last_coeff_flag_offset_8x8[63] = {
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+  3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
+  5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8
+};
+
+static const guint8 gst_h264_significant_coeff_flag_offset_8x8[63] = {
+  0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5,
+  4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7,
+  7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11,
+  12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12
+};
+
+static const guint8 gst_h264_sig_coeff_offset_dc[7] = { 0, 0, 1, 1, 2, 2, 2 };
+static const guint8 gst_h264_coeff_abs_level1_ctx[8] = { 1, 2, 3, 4, 0, 0, 0,
+  0 };
+static const guint8 gst_h264_coeff_abs_levelgt1_ctx[8] = { 5, 5, 5, 5, 6, 7, 8,
+  9 };
+static const guint8 gst_h264_coeff_abs_level_transition0[8] = { 1, 2, 3, 3, 4,
+  5, 6, 7 };
+static const guint8 gst_h264_coeff_abs_level_transition1[8] = { 4, 4, 4, 4, 5,
+  6, 7, 7 };
+
+typedef enum
+{
+  GST_H264_CABAC_P_MB_16X16,
+  GST_H264_CABAC_P_MB_16X8,
+  GST_H264_CABAC_P_MB_8X16,
+  GST_H264_CABAC_P_MB_8X8,
+  GST_H264_CABAC_P_MB_UNSUPPORTED
+} GstH264CabacPMbType;
+
+typedef enum
+{
+  GST_H264_CABAC_P_SUB_MB_8X8,
+  GST_H264_CABAC_P_SUB_MB_8X4,
+  GST_H264_CABAC_P_SUB_MB_4X8,
+  GST_H264_CABAC_P_SUB_MB_4X4
+} GstH264CabacPSubMbType;
+
+static gboolean
+gst_h264_parser_extract_rbsp_suffix (GstH264NalUnit * nalu, guint start_bit,
+    guint8 ** rbsp_data, guint * rbsp_size)
+{
+  NalReader nr;
+  guint aligned_start_bit;
+  guint remaining_bits;
+  guint size;
+  guint i;
+
+  *rbsp_data = NULL;
+  *rbsp_size = 0;
+
+  nal_reader_init (&nr, nalu->data + nalu->offset + nalu->header_bytes,
+      nalu->size - nalu->header_bytes);
+
+  aligned_start_bit = (start_bit + 7u) & ~7u;
+  if (!nal_reader_skip_long (&nr, aligned_start_bit))
+    return FALSE;
+  if (!nal_reader_is_byte_aligned (&nr))
+    return FALSE;
+
+  remaining_bits = nal_reader_get_remaining (&nr);
+  size = remaining_bits / 8;
+  if (size == 0)
+    return FALSE;
+
+  *rbsp_data = g_malloc (size);
+  for (i = 0; i < size; i++) {
+    if (!nal_reader_get_bits_uint8 (&nr, &(*rbsp_data)[i], 8)) {
+      g_free (*rbsp_data);
+      *rbsp_data = NULL;
+      return FALSE;
+    }
+  }
+
+  *rbsp_size = size;
+  return TRUE;
+}
+
+static void
+gst_h264_parser_cabac_refill (GstH264CabacContext * cabac)
+{
+  guint next0 = 0;
+  guint next1 = 0;
+
+  if (cabac->bytestream < cabac->bytestream_end)
+    next0 = cabac->bytestream[0];
+  if (cabac->bytestream + 1 < cabac->bytestream_end)
+    next1 = cabac->bytestream[1];
+
+  cabac->low += (next0 << 9) + (next1 << 1);
+  cabac->low -= 0xFFFF;
+
+  if (cabac->bytestream < cabac->bytestream_end)
+    cabac->bytestream++;
+  if (cabac->bytestream < cabac->bytestream_end)
+    cabac->bytestream++;
+}
+
+static gboolean
+gst_h264_parser_init_cabac_decoder (GstH264CabacContext * cabac,
+    const guint8 * data, guint size)
+{
+  if (size < 3)
+    return FALSE;
+
+  cabac->bytestream_start = data;
+  cabac->bytestream = data;
+  cabac->bytestream_end = data + size;
+
+  cabac->low = (*cabac->bytestream++) << 18;
+  cabac->low += (*cabac->bytestream++) << 10;
+  if ((((guintptr) cabac->bytestream) & 1u) == 0) {
+    cabac->low += (1 << 9);
+  } else {
+    if (cabac->bytestream >= cabac->bytestream_end)
+      return FALSE;
+    cabac->low += ((*cabac->bytestream++) << 2) + 2;
+  }
+
+  cabac->range = 0x1FE;
+  if ((cabac->range << 17) < cabac->low)
+    return FALSE;
+
+  return TRUE;
+}
+
+static guint8
+gst_h264_parser_init_cabac_state (gint qp, gint m, gint n)
+{
+  gint pre;
+
+  pre = 2 * (((m * qp) >> 4) + n) - 127;
+  pre = ABS (pre);
+  if (pre > 124)
+    pre = 124 + (pre & 1);
+
+  return (guint8) pre;
+}
+
+static guint8
+gst_h264_parser_get_cabac (GstH264CabacContext * cabac, guint8 * state)
+{
+  gint s = *state;
+  gint range_lps;
+  gint lps_mask;
+  guint8 bit;
+
+  range_lps = gst_h264_ff_cabac_lps_range[2 * (cabac->range & 0xC0) + s];
+  cabac->range -= range_lps;
+  lps_mask = ((cabac->range << 17) - cabac->low) >> 31;
+
+  cabac->low -= (cabac->range << 17) & lps_mask;
+  cabac->range += (range_lps - cabac->range) & lps_mask;
+
+  s ^= lps_mask;
+  *state = gst_h264_ff_cabac_mlps_state[128 + s];
+  bit = s & 1;
+
+  while (cabac->range < 0x100) {
+    cabac->range <<= 1;
+    cabac->low <<= 1;
+    if (!(cabac->low & 0xFFFF))
+      gst_h264_parser_cabac_refill (cabac);
+  }
+
+  return bit;
+}
+
+static gboolean
+gst_h264_parser_get_cabac_bypass (GstH264CabacContext * cabac)
+{
+  gint range;
+
+  cabac->low += cabac->low;
+  if (!(cabac->low & 0xFFFF))
+    gst_h264_parser_cabac_refill (cabac);
+
+  range = cabac->range << 17;
+  if (cabac->low < range)
+    return 0;
+
+  cabac->low -= range;
+  return 1;
+}
+
+static gint
+gst_h264_parser_get_cabac_bypass_sign (GstH264CabacContext * cabac, gint value)
+{
+  gint range;
+  gint mask;
+
+  cabac->low += cabac->low;
+  if (!(cabac->low & 0xFFFF))
+    gst_h264_parser_cabac_refill (cabac);
+
+  range = cabac->range << 17;
+  cabac->low -= range;
+  mask = cabac->low >> 31;
+  range &= mask;
+  cabac->low += range;
+  return (value ^ mask) - mask;
+}
+
+static gboolean
+gst_h264_parser_get_cabac_terminate (GstH264CabacContext * cabac)
+{
+  cabac->range -= 2;
+  if (cabac->low < (cabac->range << 17)) {
+    gint shift = (guint32) (cabac->range - 0x100) >> 31;
+    cabac->range <<= shift;
+    cabac->low <<= shift;
+    if (!(cabac->low & 0xFFFF))
+      gst_h264_parser_cabac_refill (cabac);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static void
+gst_h264_parser_fill_ref_rect (gint8 ref_grid[4][4], gint x, gint y, gint w,
+    gint h, gint8 ref)
+{
+  gint xx;
+  gint yy;
+
+  for (yy = y; yy < y + h; yy++) {
+    for (xx = x; xx < x + w; xx++)
+      ref_grid[yy][xx] = ref;
+  }
+}
+
+static void
+gst_h264_parser_fill_mvd_rect (gint16 mvd_grid[4][4][2], gint x, gint y, gint w,
+    gint h, gint16 mvd_x, gint16 mvd_y)
+{
+  gint xx;
+  gint yy;
+
+  for (yy = y; yy < y + h; yy++) {
+    for (xx = x; xx < x + w; xx++) {
+      mvd_grid[yy][xx][0] = mvd_x;
+      mvd_grid[yy][xx][1] = mvd_y;
+    }
+  }
+}
+
+static gint8
+gst_h264_parser_left_ref (gint8 ref_grid[4][4], const gint8 left_ref[4], gint x,
+    gint y)
+{
+  return x > 0 ? ref_grid[y][x - 1] : left_ref[y];
+}
+
+static gint8
+gst_h264_parser_top_ref (gint8 ref_grid[4][4], const gint8 top_ref[4], gint x,
+    gint y)
+{
+  return y > 0 ? ref_grid[y - 1][x] : top_ref[x];
+}
+
+static gint16
+gst_h264_parser_left_mvd (gint16 mvd_grid[4][4][2], const gint16 left_mvd[4][2],
+    gint x, gint y, gint comp)
+{
+  return x > 0 ? mvd_grid[y][x - 1][comp] : left_mvd[y][comp];
+}
+
+static gint16
+gst_h264_parser_top_mvd (gint16 mvd_grid[4][4][2], const gint16 top_mvd[4][2],
+    gint x, gint y, gint comp)
+{
+  return y > 0 ? mvd_grid[y - 1][x][comp] : top_mvd[x][comp];
+}
+
+static guint8
+gst_h264_parser_init_cabac_state_mm (gint qp, const gint8 init_mm[2])
+{
+  return gst_h264_parser_init_cabac_state (qp, init_mm[0], init_mm[1]);
+}
+
+static void
+gst_h264_parser_init_p_slice_cabac_states (guint8 * state, gint qp,
+    guint8 cabac_init_idc)
+{
+  gint i;
+
+  memset (state, 0, 1024);
+  state[11] = gst_h264_parser_init_cabac_state_mm (qp,
+      gst_h264_p_skip_cabac_init[cabac_init_idc]);
+  for (i = 0; i < 7; i++)
+    state[14 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_mb_type_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 8; i++)
+    state[40 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_mvd_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 6; i++)
+    state[54 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_ref_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 11; i++)
+    state[73 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_cbp_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 4; i++)
+    state[60 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_qp_delta_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 6; i++)
+    state[64 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_intra_chroma_pred_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 12; i++)
+    state[93 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_residual_cbf_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 33; i++) {
+    state[134 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_residual_sig_cabac_init[cabac_init_idc][i]);
+    state[195 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_residual_last_cabac_init[cabac_init_idc][i]);
+  }
+  for (i = 0; i < 29; i++)
+    state[247 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_residual_abs_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 37; i++)
+    state[399 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_transform8x8_cabac_init[cabac_init_idc][i]);
+  for (i = 0; i < 4; i++)
+    state[1012 + i] = gst_h264_parser_init_cabac_state_mm (qp,
+        gst_h264_p_residual_cbf_cabac_init[cabac_init_idc][i]);
+}
+
+static gboolean
+gst_h264_parser_decode_cabac_mb_skip (GstH264CabacContext * cabac,
+    guint8 * state, gboolean left_non_skip, gboolean top_non_skip)
+{
+  gint ctx = (left_non_skip ? 1 : 0) + (top_non_skip ? 1 : 0);
+
+  return gst_h264_parser_get_cabac (cabac, &state[11 + ctx]) != 0;
+}
+
+static GstH264CabacPMbType
+gst_h264_parser_decode_cabac_p_mb_type (GstH264CabacContext * cabac,
+    guint8 * state)
+{
+  gint type;
+
+  if (gst_h264_parser_get_cabac (cabac, &state[14]) != 0)
+    return GST_H264_CABAC_P_MB_UNSUPPORTED;
+
+  if (gst_h264_parser_get_cabac (cabac, &state[15]) == 0)
+    type = 3 * gst_h264_parser_get_cabac (cabac, &state[16]);
+  else
+    type = 2 - gst_h264_parser_get_cabac (cabac, &state[17]);
+
+  switch (type) {
+    case 0:
+      return GST_H264_CABAC_P_MB_16X16;
+    case 1:
+      return GST_H264_CABAC_P_MB_16X8;
+    case 2:
+      return GST_H264_CABAC_P_MB_8X16;
+    case 3:
+      return GST_H264_CABAC_P_MB_8X8;
+    default:
+      return GST_H264_CABAC_P_MB_UNSUPPORTED;
+  }
+}
+
+static gint
+gst_h264_parser_decode_cabac_intra_mb_type (GstH264CabacContext * cabac,
+    guint8 * state)
+{
+  gint mb_type;
+
+  if (gst_h264_parser_get_cabac (cabac, &state[17]) == 0)
+    return 0;
+  if (gst_h264_parser_get_cabac_terminate (cabac))
+    return 25;
+
+  mb_type = 1;
+  mb_type += 12 * gst_h264_parser_get_cabac (cabac, &state[18]);
+  if (gst_h264_parser_get_cabac (cabac, &state[19]) != 0)
+    mb_type += 4 + 4 * gst_h264_parser_get_cabac (cabac, &state[19]);
+  mb_type += 2 * gst_h264_parser_get_cabac (cabac, &state[20]);
+  mb_type += gst_h264_parser_get_cabac (cabac, &state[20]);
+  return mb_type;
+}
+
+static GstH264CabacPSubMbType
+gst_h264_parser_decode_cabac_p_sub_mb_type (GstH264CabacContext * cabac,
+    guint8 * state)
+{
+  if (gst_h264_parser_get_cabac (cabac, &state[21]) != 0)
+    return GST_H264_CABAC_P_SUB_MB_8X8;
+  if (gst_h264_parser_get_cabac (cabac, &state[22]) == 0)
+    return GST_H264_CABAC_P_SUB_MB_8X4;
+  if (gst_h264_parser_get_cabac (cabac, &state[23]) != 0)
+    return GST_H264_CABAC_P_SUB_MB_4X8;
+  return GST_H264_CABAC_P_SUB_MB_4X4;
+}
+
+static gboolean
+gst_h264_parser_decode_cabac_mb_ref (GstH264CabacContext * cabac,
+    guint8 * state, gint8 left_ref, gint8 top_ref, guint8 ref_count,
+    guint8 * ref_idx)
+{
+  guint8 ref = 0;
+  gint ctx = 0;
+
+  if (ref_count <= 1) {
+    *ref_idx = 0;
+    return TRUE;
+  }
+
+  if (left_ref > 0)
+    ctx++;
+  if (top_ref > 0)
+    ctx += 2;
+
+  while (gst_h264_parser_get_cabac (cabac, &state[54 + ctx]) != 0) {
+    ref++;
+    ctx = (ctx >> 2) + 4;
+    if (ref >= ref_count)
+      return FALSE;
+  }
+
+  *ref_idx = ref;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parser_decode_cabac_mb_mvd_component (GstH264CabacContext * cabac,
+    guint8 * state, gint ctxbase, gint amvd, gint16 * out)
+{
+  gint mvd;
+  gint clipped;
+
+  if (gst_h264_parser_get_cabac (cabac,
+          &state[ctxbase + ((amvd - 3) >> 31) + ((amvd - 33) >> 31) + 2]) == 0) {
+    *out = 0;
+    return TRUE;
+  }
+
+  mvd = 1;
+  ctxbase += 3;
+  while (mvd < 9 && gst_h264_parser_get_cabac (cabac, &state[ctxbase]) != 0) {
+    if (mvd < 4)
+      ctxbase++;
+    mvd++;
+  }
+
+  if (mvd >= 9) {
+    gint k = 3;
+
+    while (gst_h264_parser_get_cabac_bypass (cabac) != 0) {
+      mvd += 1 << k;
+      k++;
+      if (k > 24)
+        return FALSE;
+    }
+    while (k-- > 0)
+      mvd += gst_h264_parser_get_cabac_bypass (cabac) << k;
+  }
+
+  clipped = mvd < 70 ? mvd : 70;
+  *out = (gint16) gst_h264_parser_get_cabac_bypass_sign (cabac, -clipped);
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parser_decode_cabac_mb_mvd (GstH264CabacContext * cabac,
+    guint8 * state, gint16 mvd_grid[4][4][2], const gint16 left_mvd[4][2],
+    const gint16 top_mvd[4][2], gint x, gint y, gint16 * out_x, gint16 * out_y)
+{
+  gint amvd_x;
+  gint amvd_y;
+
+  amvd_x =
+      gst_h264_parser_left_mvd (mvd_grid, left_mvd, x, y, 0) +
+      gst_h264_parser_top_mvd (mvd_grid, top_mvd, x, y, 0);
+  amvd_y =
+      gst_h264_parser_left_mvd (mvd_grid, left_mvd, x, y, 1) +
+      gst_h264_parser_top_mvd (mvd_grid, top_mvd, x, y, 1);
+
+  if (!gst_h264_parser_decode_cabac_mb_mvd_component (cabac, state, 40, amvd_x,
+          out_x))
+    return FALSE;
+  if (!gst_h264_parser_decode_cabac_mb_mvd_component (cabac, state, 47, amvd_y,
+          out_y))
+    return FALSE;
+  return TRUE;
+}
+
+static guint16
+gst_h264_parser_decode_cabac_mb_cbp_luma (GstH264CabacContext * cabac,
+    guint8 * state, guint16 left_cbp, guint16 top_cbp)
+{
+  guint16 cbp = 0;
+  gint ctx;
+
+  ctx = !(left_cbp & 0x02) + 2 * !(top_cbp & 0x04);
+  cbp += gst_h264_parser_get_cabac (cabac, &state[73 + ctx]);
+  ctx = !(cbp & 0x01) + 2 * !(top_cbp & 0x08);
+  cbp += gst_h264_parser_get_cabac (cabac, &state[73 + ctx]) << 1;
+  ctx = !(left_cbp & 0x08) + 2 * !(cbp & 0x01);
+  cbp += gst_h264_parser_get_cabac (cabac, &state[73 + ctx]) << 2;
+  ctx = !(cbp & 0x04) + 2 * !(cbp & 0x02);
+  cbp += gst_h264_parser_get_cabac (cabac, &state[73 + ctx]) << 3;
+  return cbp;
+}
+
+static guint16
+gst_h264_parser_decode_cabac_mb_cbp_chroma (GstH264CabacContext * cabac,
+    guint8 * state, guint16 left_cbp, guint16 top_cbp)
+{
+  gint ctx = 0;
+  gint cbp_a = (left_cbp >> 4) & 0x03;
+  gint cbp_b = (top_cbp >> 4) & 0x03;
+
+  if (cbp_a > 0)
+    ctx++;
+  if (cbp_b > 0)
+    ctx += 2;
+  if (gst_h264_parser_get_cabac (cabac, &state[77 + ctx]) == 0)
+    return 0;
+
+  ctx = 4;
+  if (cbp_a == 2)
+    ctx++;
+  if (cbp_b == 2)
+    ctx += 2;
+  return 1 + gst_h264_parser_get_cabac (cabac, &state[77 + ctx]);
+}
+
+static guint8
+gst_h264_parser_decode_cabac_mb_chroma_pre_mode (GstH264CabacContext * cabac,
+    guint8 * state, guint8 left_chroma_pred_mode, guint8 top_chroma_pred_mode)
+{
+  gint ctx = 0;
+
+  if (left_chroma_pred_mode != 0)
+    ctx++;
+  if (top_chroma_pred_mode != 0)
+    ctx++;
+
+  if (gst_h264_parser_get_cabac (cabac, &state[64 + ctx]) == 0)
+    return 0;
+  if (gst_h264_parser_get_cabac (cabac, &state[67]) == 0)
+    return 1;
+  if (gst_h264_parser_get_cabac (cabac, &state[67]) == 0)
+    return 2;
+  return 3;
+}
+
+static guint8
+gst_h264_parser_get_luma_left_nnz (const guint8 nnz[4][4],
+    const guint8 left_luma_nnz[4], gint x, gint y)
+{
+  return x > 0 ? nnz[y][x - 1] : left_luma_nnz[y];
+}
+
+static guint8
+gst_h264_parser_get_luma_top_nnz (const guint8 nnz[4][4],
+    const guint8 * top_luma_nnz, gint x, gint y)
+{
+  return y > 0 ? nnz[y - 1][x] : top_luma_nnz[x];
+}
+
+static guint8
+gst_h264_parser_get_chroma_left_nnz (const guint8 nnz[2][2],
+    const guint8 left_chroma_nnz[2], gint x, gint y)
+{
+  return x > 0 ? nnz[y][x - 1] : left_chroma_nnz[y];
+}
+
+static guint8
+gst_h264_parser_get_chroma_top_nnz (const guint8 nnz[2][2],
+    const guint8 * top_chroma_nnz, gint x, gint y)
+{
+  return y > 0 ? nnz[y - 1][x] : top_chroma_nnz[x];
+}
+
+static gint
+gst_h264_parser_decode_cabac_residual_cbf_ctx (guint16 left_cbp, guint16 top_cbp,
+    const guint8 luma_nnz[4][4], const guint8 * top_luma_nnz,
+    const guint8 left_luma_nnz[4], const guint8 chroma_nnz[2][2],
+    const guint8 * top_chroma_nnz, const guint8 left_chroma_nnz[2],
+    gint cat, gint block_idx, gint plane)
+{
+  gint ctx = 0;
+  guint8 left;
+  guint8 top;
+
+  switch (cat) {
+    case 0:
+      if (left_cbp & (0x100u << plane))
+        ctx++;
+      if (top_cbp & (0x100u << plane))
+        ctx += 2;
+      return 85 + ctx;
+    case 1:
+      left = gst_h264_parser_get_luma_left_nnz (luma_nnz, left_luma_nnz,
+          block_idx & 3, block_idx >> 2);
+      top = gst_h264_parser_get_luma_top_nnz (luma_nnz, top_luma_nnz,
+          block_idx & 3, block_idx >> 2);
+      if (left > 0)
+        ctx++;
+      if (top > 0)
+        ctx += 2;
+      return 89 + ctx;
+    case 2:
+      left = gst_h264_parser_get_luma_left_nnz (luma_nnz, left_luma_nnz,
+          block_idx & 3, block_idx >> 2);
+      top = gst_h264_parser_get_luma_top_nnz (luma_nnz, top_luma_nnz,
+          block_idx & 3, block_idx >> 2);
+      if (left > 0)
+        ctx++;
+      if (top > 0)
+        ctx += 2;
+      return 93 + ctx;
+    case 3:
+      if (left_cbp & (0x40u << plane))
+        ctx++;
+      if (top_cbp & (0x40u << plane))
+        ctx += 2;
+      return 97 + ctx;
+    case 4:
+      left = gst_h264_parser_get_chroma_left_nnz (chroma_nnz, left_chroma_nnz,
+          block_idx & 1, block_idx >> 1);
+      top = gst_h264_parser_get_chroma_top_nnz (chroma_nnz, top_chroma_nnz,
+          block_idx & 1, block_idx >> 1);
+      if (left > 0)
+        ctx++;
+      if (top > 0)
+        ctx += 2;
+      return 101 + ctx;
+    case 5:
+      left = gst_h264_parser_get_luma_left_nnz (luma_nnz, left_luma_nnz,
+          (block_idx & 1) * 2, (block_idx >> 1) * 2);
+      top = gst_h264_parser_get_luma_top_nnz (luma_nnz, top_luma_nnz,
+          (block_idx & 1) * 2, (block_idx >> 1) * 2);
+      if (left > 0)
+        ctx++;
+      if (top > 0)
+        ctx += 2;
+      return 1012 + ctx;
+    default:
+      return -1;
+  }
+}
+
+static gboolean
+gst_h264_parser_skip_cabac_coeff_levels (GstH264CabacContext * cabac,
+    guint8 * state, gint abs_level_base, guint coeff_count)
+{
+  gint node_ctx = 0;
+
+  while (coeff_count-- > 0) {
+    if (gst_h264_parser_get_cabac (cabac,
+            &state[abs_level_base +
+                gst_h264_coeff_abs_level1_ctx[node_ctx]]) == 0) {
+      node_ctx = gst_h264_coeff_abs_level_transition0[node_ctx];
+      (void) gst_h264_parser_get_cabac_bypass_sign (cabac, -1);
+    } else {
+      guint coeff_abs = 2;
+
+      node_ctx = gst_h264_coeff_abs_level_transition1[node_ctx];
+      while (coeff_abs < 15 && gst_h264_parser_get_cabac (cabac,
+              &state[abs_level_base +
+                  gst_h264_coeff_abs_levelgt1_ctx[node_ctx]]) != 0)
+        coeff_abs++;
+      if (coeff_abs >= 15) {
+        gint j = 0;
+
+        while (gst_h264_parser_get_cabac_bypass (cabac) != 0 && j < 23)
+          j++;
+        coeff_abs = 1;
+        while (j-- > 0)
+          coeff_abs += coeff_abs + gst_h264_parser_get_cabac_bypass (cabac);
+        coeff_abs += 14;
+      }
+      (void) gst_h264_parser_get_cabac_bypass_sign (cabac, -(gint) coeff_abs);
+    }
+  }
+
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parser_skip_cabac_residual_4x4 (GstH264CabacContext * cabac,
+    guint8 * state, gint sig_base, gint last_base, gint abs_level_base,
+    guint max_coeff, guint8 * coeff_count)
+{
+  guint count = 0;
+  guint last;
+
+  for (last = 0; last + 1 < max_coeff; last++) {
+    if (gst_h264_parser_get_cabac (cabac, &state[sig_base + last]) == 0)
+      continue;
+    count++;
+    if (gst_h264_parser_get_cabac (cabac, &state[last_base + last]) != 0) {
+      last = max_coeff;
+      break;
+    }
+  }
+
+  if (last == max_coeff - 1)
+    count++;
+
+  if (count == 0) {
+    *coeff_count = 0;
+    return TRUE;
+  }
+
+  if (!gst_h264_parser_skip_cabac_coeff_levels (cabac, state, abs_level_base,
+          count))
+    return FALSE;
+
+  *coeff_count = (guint8) count;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parser_skip_cabac_residual_8x8 (GstH264CabacContext * cabac,
+    guint8 * state, gint sig_base, gint last_base, gint abs_level_base,
+    guint8 * coeff_count)
+{
+  guint count = 0;
+  guint last;
+
+  for (last = 0; last < 63; last++) {
+    if (gst_h264_parser_get_cabac (cabac,
+            &state[sig_base + gst_h264_significant_coeff_flag_offset_8x8[last]])
+        == 0)
+      continue;
+    count++;
+    if (gst_h264_parser_get_cabac (cabac,
+            &state[last_base + gst_h264_last_coeff_flag_offset_8x8[last]]) != 0) {
+      last = 64;
+      break;
+    }
+  }
+
+  if (last == 63)
+    count++;
+
+  if (count == 0) {
+    *coeff_count = 0;
+    return TRUE;
+  }
+
+  if (!gst_h264_parser_skip_cabac_coeff_levels (cabac, state, abs_level_base,
+          count))
+    return FALSE;
+
+  *coeff_count = (guint8) count;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parser_skip_cabac_chroma_dc (GstH264CabacContext * cabac,
+    guint8 * state, guint16 left_cbp, guint16 top_cbp, guint plane,
+    guint16 * cbp_io)
+{
+  gint ctx_idx;
+  guint count = 0;
+  guint last;
+
+  ctx_idx = gst_h264_parser_decode_cabac_residual_cbf_ctx (left_cbp, top_cbp,
+      NULL, NULL, NULL, NULL, NULL, NULL, 3, 0, plane);
+  if (ctx_idx < 0)
+    return FALSE;
+  if (gst_h264_parser_get_cabac (cabac, &state[ctx_idx]) == 0)
+    return TRUE;
+
+  for (last = 0; last < 3; last++) {
+    guint off = gst_h264_sig_coeff_offset_dc[last];
+
+    if (gst_h264_parser_get_cabac (cabac, &state[149 + off]) == 0)
+      continue;
+    count++;
+    if (gst_h264_parser_get_cabac (cabac, &state[210 + off]) != 0) {
+      last = 4;
+      break;
+    }
+  }
+
+  if (last == 3)
+    count++;
+
+  if (count == 0)
+    return TRUE;
+
+  if (!gst_h264_parser_skip_cabac_coeff_levels (cabac, state, 257, count))
+    return FALSE;
+
+  *cbp_io |= 0x40u << plane;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parser_skip_cabac_luma_dc (GstH264CabacContext * cabac,
+    guint8 * state, guint16 left_cbp, guint16 top_cbp, guint16 * cbp_io)
+{
+  gint ctx_idx;
+  guint8 coeff_count;
+
+  ctx_idx = gst_h264_parser_decode_cabac_residual_cbf_ctx (left_cbp, top_cbp,
+      NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0);
+  if (ctx_idx < 0)
+    return FALSE;
+  if (gst_h264_parser_get_cabac (cabac, &state[ctx_idx]) == 0)
+    return TRUE;
+
+  if (!gst_h264_parser_skip_cabac_residual_4x4 (cabac, state, 105, 166, 227,
+          16, &coeff_count))
+    return FALSE;
+
+  *cbp_io |= 0x100u;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parser_decode_cabac_mb_qp_delta (GstH264CabacContext * cabac,
+    guint8 * state, gboolean last_qscale_nonzero, gboolean * delta_nonzero)
+{
+  *delta_nonzero = FALSE;
+  if (gst_h264_parser_get_cabac (cabac,
+          &state[60 + (last_qscale_nonzero ? 1 : 0)]) == 0)
+    return TRUE;
+  *delta_nonzero = TRUE;
+
+  for (;;) {
+    static const guint ctx_map[2] = { 62, 63 };
+    guint ctx = 62;
+    guint val = 1;
+
+    while (gst_h264_parser_get_cabac (cabac, &state[ctx]) != 0) {
+      val++;
+      ctx = ctx_map[val > 1];
+      if (val > 128)
+        return FALSE;
+    }
+    return TRUE;
+  }
+}
+
+static gboolean
+gst_h264_parser_skip_cabac_inter_residual (GstH264CabacContext * cabac,
+    guint8 * state, guint16 left_cbp, guint16 top_cbp, guint16 * cbp_io,
+    gboolean dct8x8_allowed,
+    guint8 top_transform8x8, guint8 left_transform8x8,
+    guint8 luma_nnz[4][4], const guint8 * top_luma_nnz,
+    const guint8 left_luma_nnz[4], guint8 chroma_nnz[2][2][2],
+    const guint8 * top_chroma_u_nnz, const guint8 left_chroma_u_nnz[2],
+    const guint8 * top_chroma_v_nnz, const guint8 left_chroma_v_nnz[2],
+    gboolean last_qscale_nonzero, gboolean * delta_nonzero_out,
+    gboolean * transform8x8_out)
+{
+  guint16 cbp = *cbp_io;
+  gboolean transform8x8 = FALSE;
+  guint i8x8;
+
+  if (cbp != 0) {
+    if (!gst_h264_parser_decode_cabac_mb_qp_delta (cabac, state,
+            last_qscale_nonzero, delta_nonzero_out))
+      return FALSE;
+  } else {
+    *delta_nonzero_out = FALSE;
+  }
+
+  if (dct8x8_allowed && (cbp & 0x0F) != 0)
+    transform8x8 = gst_h264_parser_get_cabac (cabac,
+        &state[399 + top_transform8x8 + left_transform8x8]) != 0;
+
+  for (i8x8 = 0; i8x8 < 4; i8x8++) {
+    gint x8 = (i8x8 & 1) ? 2 : 0;
+    gint y8 = (i8x8 & 2) ? 2 : 0;
+
+    if ((cbp & (1u << i8x8)) == 0) {
+      gst_h264_parser_fill_ref_rect ((gint8 (*)[4]) luma_nnz, x8, y8, 2, 2, 0);
+      continue;
+    }
+
+    if (transform8x8) {
+      gint ctx_idx;
+      guint8 coeff_count;
+
+      ctx_idx = gst_h264_parser_decode_cabac_residual_cbf_ctx (*cbp_io, *cbp_io,
+          luma_nnz, top_luma_nnz, left_luma_nnz, NULL, NULL, NULL, 5, i8x8, 0);
+      if (ctx_idx < 0)
+        return FALSE;
+      if (gst_h264_parser_get_cabac (cabac, &state[ctx_idx]) == 0) {
+        gst_h264_parser_fill_ref_rect ((gint8 (*)[4]) luma_nnz, x8, y8, 2, 2,
+            0);
+        continue;
+      }
+      if (!gst_h264_parser_skip_cabac_residual_8x8 (cabac, state, 402, 417,
+              426, &coeff_count))
+        return FALSE;
+      gst_h264_parser_fill_ref_rect ((gint8 (*)[4]) luma_nnz, x8, y8, 2, 2,
+          coeff_count);
+    } else {
+      guint i4x4;
+
+      for (i4x4 = 0; i4x4 < 4; i4x4++) {
+        gint x4 = x8 + (i4x4 & 1);
+        gint y4 = y8 + (i4x4 >> 1);
+        gint ctx_idx;
+        guint8 coeff_count;
+
+        ctx_idx = gst_h264_parser_decode_cabac_residual_cbf_ctx (*cbp_io,
+            *cbp_io, luma_nnz, top_luma_nnz, left_luma_nnz, NULL, NULL, NULL,
+            2, y4 * 4 + x4, 0);
+        if (ctx_idx < 0)
+          return FALSE;
+        if (gst_h264_parser_get_cabac (cabac, &state[ctx_idx]) == 0) {
+          luma_nnz[y4][x4] = 0;
+          continue;
+        }
+        if (!gst_h264_parser_skip_cabac_residual_4x4 (cabac, state, 134, 195,
+                247, 16, &coeff_count))
+          return FALSE;
+        luma_nnz[y4][x4] = coeff_count;
+      }
+    }
+  }
+
+  if (cbp & 0x30) {
+    if (!gst_h264_parser_skip_cabac_chroma_dc (cabac, state, left_cbp, top_cbp,
+            0, cbp_io))
+      return FALSE;
+    if (!gst_h264_parser_skip_cabac_chroma_dc (cabac, state, left_cbp, top_cbp,
+            1, cbp_io))
+      return FALSE;
+  }
+
+  if (cbp & 0x20) {
+    guint plane;
+
+    for (plane = 0; plane < 2; plane++) {
+      guint i;
+      const guint8 *top_chroma_nnz = plane == 0 ? top_chroma_u_nnz :
+          top_chroma_v_nnz;
+      const guint8 *left_chroma_nnz = plane == 0 ? left_chroma_u_nnz :
+          left_chroma_v_nnz;
+
+      for (i = 0; i < 4; i++) {
+        gint x = i & 1;
+        gint y = i >> 1;
+        gint ctx_idx;
+        guint8 coeff_count;
+
+        ctx_idx = gst_h264_parser_decode_cabac_residual_cbf_ctx (*cbp_io,
+            *cbp_io, NULL, NULL, NULL, chroma_nnz[plane], top_chroma_nnz,
+            left_chroma_nnz, 4, i, plane);
+        if (ctx_idx < 0)
+          return FALSE;
+        if (gst_h264_parser_get_cabac (cabac, &state[ctx_idx]) == 0) {
+          chroma_nnz[plane][y][x] = 0;
+          continue;
+        }
+        if (!gst_h264_parser_skip_cabac_residual_4x4 (cabac, state, 152, 213,
+                266, 15, &coeff_count))
+          return FALSE;
+        chroma_nnz[plane][y][x] = coeff_count;
+      }
+    }
+  }
+
+  *transform8x8_out = transform8x8;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parser_skip_cabac_intra16x16 (GstH264CabacContext * cabac,
+    guint8 * state, guint16 left_cbp, guint16 top_cbp,
+    guint8 left_chroma_pred_mode, guint8 top_chroma_pred_mode,
+    guint8 luma_nnz[4][4], const guint8 * top_luma_nnz,
+    const guint8 left_luma_nnz[4], guint8 chroma_nnz[2][2][2],
+    const guint8 * top_chroma_u_nnz, const guint8 left_chroma_u_nnz[2],
+    const guint8 * top_chroma_v_nnz, const guint8 left_chroma_v_nnz[2],
+    gboolean last_qscale_nonzero, gint intra_mb_type, guint16 * cbp_io,
+    guint8 * chroma_pred_mode_out, gboolean * delta_nonzero_out)
+{
+  guint16 cbp;
+  guint intra_idx;
+  guint i;
+
+  if (intra_mb_type <= 0 || intra_mb_type >= 25)
+    return FALSE;
+
+  intra_idx = (guint) (intra_mb_type - 1);
+  cbp = intra_idx >= 12 ? 0x0Fu : 0u;
+  cbp |= ((intra_idx % 12u) >> 2) << 4;
+  *cbp_io = cbp;
+
+  *chroma_pred_mode_out = gst_h264_parser_decode_cabac_mb_chroma_pre_mode (
+      cabac, state, left_chroma_pred_mode, top_chroma_pred_mode);
+
+  if (!gst_h264_parser_decode_cabac_mb_qp_delta (cabac, state,
+          last_qscale_nonzero, delta_nonzero_out))
+    return FALSE;
+
+  if (!gst_h264_parser_skip_cabac_luma_dc (cabac, state, left_cbp, top_cbp,
+          cbp_io))
+    return FALSE;
+
+  if ((cbp & 0x0F) != 0) {
+    for (i = 0; i < 16; i++) {
+      gint ctx_idx;
+      guint8 coeff_count;
+      gint x = i & 3;
+      gint y = i >> 2;
+
+      ctx_idx = gst_h264_parser_decode_cabac_residual_cbf_ctx (left_cbp,
+          top_cbp, luma_nnz, top_luma_nnz, left_luma_nnz, NULL, NULL, NULL, 1,
+          i, 0);
+      if (ctx_idx < 0)
+        return FALSE;
+      if (gst_h264_parser_get_cabac (cabac, &state[ctx_idx]) == 0) {
+        luma_nnz[y][x] = 0;
+        continue;
+      }
+      if (!gst_h264_parser_skip_cabac_residual_4x4 (cabac, state, 120, 181,
+              237, 15, &coeff_count))
+        return FALSE;
+      luma_nnz[y][x] = coeff_count;
+    }
+  } else {
+    memset (luma_nnz, 0, sizeof (guint8[4][4]));
+  }
+
+  if (cbp & 0x30) {
+    if (!gst_h264_parser_skip_cabac_chroma_dc (cabac, state, left_cbp, top_cbp,
+            0, cbp_io))
+      return FALSE;
+    if (!gst_h264_parser_skip_cabac_chroma_dc (cabac, state, left_cbp, top_cbp,
+            1, cbp_io))
+      return FALSE;
+  }
+
+  if (cbp & 0x20) {
+    guint plane;
+
+    for (plane = 0; plane < 2; plane++) {
+      guint i4x4;
+      const guint8 *top_chroma_nnz = plane == 0 ? top_chroma_u_nnz :
+          top_chroma_v_nnz;
+      const guint8 *left_chroma_nnz = plane == 0 ? left_chroma_u_nnz :
+          left_chroma_v_nnz;
+
+      for (i4x4 = 0; i4x4 < 4; i4x4++) {
+        gint ctx_idx;
+        guint8 coeff_count;
+        gint x = i4x4 & 1;
+        gint y = i4x4 >> 1;
+
+        ctx_idx = gst_h264_parser_decode_cabac_residual_cbf_ctx (left_cbp,
+            top_cbp, NULL, NULL, NULL, chroma_nnz[plane], top_chroma_nnz,
+            left_chroma_nnz, 4, i4x4, plane);
+        if (ctx_idx < 0)
+          return FALSE;
+        if (gst_h264_parser_get_cabac (cabac, &state[ctx_idx]) == 0) {
+          chroma_nnz[plane][y][x] = 0;
+          continue;
+        }
+        if (!gst_h264_parser_skip_cabac_residual_4x4 (cabac, state, 152, 213,
+                266, 15, &coeff_count))
+          return FALSE;
+        chroma_nnz[plane][y][x] = coeff_count;
+      }
+    }
+  } else {
+    memset (chroma_nnz, 0, sizeof (guint8[2][2][2]));
+  }
+
+  return TRUE;
+}
+
+gst_h264_parser_identify_cabac_p_ref_usage (const GstH264PPS * pps,
+    const GstH264SPS * sps, GstH264NalUnit * nalu, GstH264SliceHdr * slice,
+    guint32 total_mbs, guint32 * used_ref_mask_l0)
+{
+  GstH264CabacContext cabac;
+  guint8 state[1024];
+  guint8 *rbsp = NULL;
+  guint rbsp_size = 0;
+  gint slice_qp;
+  guint8 *top_non_skip = NULL;
+  guint16 *top_cbp = NULL;
+  guint8 *top_transform8x8 = NULL;
+  guint8 *top_chroma_pred_mode = NULL;
+  guint8 *top_luma_nnz = NULL;
+  guint8 *top_chroma_u_nnz = NULL;
+  guint8 *top_chroma_v_nnz = NULL;
+  gint8 *top_ref_all = NULL;
+  gint16(*top_mvd_all)[2] = NULL;
+  gint8 left_ref[4] = { -1, -1, -1, -1 };
+  gint16 left_mvd[4][2] = { {0, 0}, {0, 0}, {0, 0}, {0, 0} };
+  guint8 left_luma_nnz[4] = { 0, 0, 0, 0 };
+  guint8 left_chroma_u_nnz[2] = { 0, 0 };
+  guint8 left_chroma_v_nnz[2] = { 0, 0 };
+  guint8 left_chroma_pred_mode = 0;
+  gboolean left_non_skip = FALSE;
+  gboolean left_transform8x8 = FALSE;
+  guint16 left_cbp = 0;
+  gboolean last_qscale_nonzero = FALSE;
+  guint mb_width;
+  guint mb_addr;
+  guint mb_x;
+  guint mb_y;
+
+  if (pps->num_slice_groups_minus1 > 0 || slice->cabac_init_idc > 2)
+    return FALSE;
+
+  if (!gst_h264_parser_extract_rbsp_suffix (nalu, slice->header_size, &rbsp,
+          &rbsp_size))
+    return FALSE;
+  if (!gst_h264_parser_init_cabac_decoder (&cabac, rbsp, rbsp_size))
+    goto done;
+
+  slice_qp = CLAMP ((gint) pps->pic_init_qp_minus26 + 26 + slice->slice_qp_delta -
+      6 * (gint) sps->bit_depth_luma_minus8, 0, 51);
+  gst_h264_parser_init_p_slice_cabac_states (state, slice_qp,
+      slice->cabac_init_idc);
+
+  mb_width = sps->pic_width_in_mbs_minus1 + 1;
+  top_non_skip = g_new0 (guint8, mb_width);
+  top_cbp = g_new0 (guint16, mb_width);
+  top_transform8x8 = g_new0 (guint8, mb_width);
+  top_chroma_pred_mode = g_new0 (guint8, mb_width);
+  top_luma_nnz = g_new0 (guint8, mb_width * 4);
+  top_chroma_u_nnz = g_new0 (guint8, mb_width * 2);
+  top_chroma_v_nnz = g_new0 (guint8, mb_width * 2);
+  top_ref_all = g_new (gint8, mb_width * 4);
+  top_mvd_all = (gint16 (*)[2]) g_new0 (gint16, mb_width * 4 * 2);
+  memset (top_ref_all, 0xFF, mb_width * 4);
+
+  mb_addr = slice->first_mb_in_slice;
+  mb_x = mb_addr % mb_width;
+  mb_y = mb_addr / mb_width;
+
+  for (;;) {
+    gint8 ref_grid[4][4];
+    gint16 mvd_grid[4][4][2] = { {{0, 0}} };
+    guint8 luma_nnz[4][4] = { {0, 0, 0, 0}, {0, 0, 0, 0},
+      {0, 0, 0, 0}, {0, 0, 0, 0}
+    };
+    guint8 chroma_nnz[2][2][2] = {
+      { {0, 0}, {0, 0} },
+      { {0, 0}, {0, 0} }
+    };
+    guint8 *top_non_skip_mb;
+    guint16 *top_cbp_mb;
+    guint8 *top_transform8x8_mb;
+    guint8 *top_chroma_pred_mode_mb;
+    guint8 *top_luma_nnz_mb;
+    guint8 *top_chroma_u_nnz_mb;
+    guint8 *top_chroma_v_nnz_mb;
+    gint8 *top_ref;
+    gint16(*top_mvd)[2];
+    gboolean skip;
+    gboolean non_skip;
+    gboolean transform8x8 = FALSE;
+    guint8 chroma_pred_mode = 0;
+    gboolean dct8x8_allowed = pps->transform_8x8_mode_flag;
+    gboolean qp_delta_nonzero = FALSE;
+    guint16 cbp = 0;
+    guint16 left_cbp_ctx = left_cbp;
+    guint16 top_cbp_ctx = 0;
+    guint x4;
+    guint y4;
+
+    if (mb_addr >= total_mbs)
+      goto done;
+
+    memset (ref_grid, 0xFF, sizeof (ref_grid));
+    top_non_skip_mb = top_non_skip + mb_x;
+    top_cbp_mb = top_cbp + mb_x;
+    top_transform8x8_mb = top_transform8x8 + mb_x;
+    top_chroma_pred_mode_mb = top_chroma_pred_mode + mb_x;
+    top_luma_nnz_mb = top_luma_nnz + mb_x * 4;
+    top_chroma_u_nnz_mb = top_chroma_u_nnz + mb_x * 2;
+    top_chroma_v_nnz_mb = top_chroma_v_nnz + mb_x * 2;
+    top_ref = top_ref_all + mb_x * 4;
+    top_mvd = top_mvd_all + mb_x * 4;
+    top_cbp_ctx = *top_cbp_mb;
+
+    if (mb_x == 0)
+      left_cbp_ctx = 0x00Fu;
+    if (mb_y == 0)
+      top_cbp_ctx = 0x00Fu;
+
+    skip = gst_h264_parser_decode_cabac_mb_skip (&cabac, state, left_non_skip,
+        *top_non_skip_mb != 0);
+    if (skip) {
+      *used_ref_mask_l0 |= 1u;
+      gst_h264_parser_fill_ref_rect (ref_grid, 0, 0, 4, 4, 0);
+      gst_h264_parser_fill_mvd_rect (mvd_grid, 0, 0, 4, 4, 0, 0);
+      non_skip = FALSE;
+    } else {
+      GstH264CabacPMbType mb_type;
+
+      non_skip = TRUE;
+      mb_type = gst_h264_parser_decode_cabac_p_mb_type (&cabac, state);
+      if (mb_type == GST_H264_CABAC_P_MB_UNSUPPORTED) {
+        gint intra_mb_type = gst_h264_parser_decode_cabac_intra_mb_type (&cabac,
+            state);
+
+        left_cbp_ctx = mb_x == 0 ? 0x7CFu : left_cbp;
+        top_cbp_ctx = mb_y == 0 ? 0x7CFu : *top_cbp_mb;
+
+        if (intra_mb_type > 0 && intra_mb_type < 25) {
+          if (!gst_h264_parser_skip_cabac_intra16x16 (&cabac, state,
+                  left_cbp_ctx, top_cbp_ctx, left_chroma_pred_mode,
+                  *top_chroma_pred_mode_mb, luma_nnz, top_luma_nnz_mb,
+                  left_luma_nnz, chroma_nnz, top_chroma_u_nnz_mb,
+                  left_chroma_u_nnz, top_chroma_v_nnz_mb, left_chroma_v_nnz,
+                  last_qscale_nonzero, intra_mb_type, &cbp, &chroma_pred_mode,
+                  &qp_delta_nonzero))
+            goto done;
+        } else {
+          goto done;
+        }
+
+        goto finish_mb;
+      }
+
+      if (mb_type == GST_H264_CABAC_P_MB_8X8) {
+        GstH264CabacPSubMbType sub_mb_type[4];
+        guint8 sub_ref[4];
+        guint i;
+
+        for (i = 0; i < 4; i++) {
+          gint sx = (i & 1) ? 2 : 0;
+          gint sy = (i & 2) ? 2 : 0;
+
+          sub_mb_type[i] = gst_h264_parser_decode_cabac_p_sub_mb_type (&cabac,
+              state);
+          if (!gst_h264_parser_decode_cabac_mb_ref (&cabac, state,
+                  gst_h264_parser_left_ref (ref_grid, left_ref, sx, sy),
+                  gst_h264_parser_top_ref (ref_grid, top_ref, sx, sy),
+                  slice->num_ref_idx_l0_active_minus1 + 1, &sub_ref[i]))
+            goto done;
+          *used_ref_mask_l0 |= 1u << sub_ref[i];
+          gst_h264_parser_fill_ref_rect (ref_grid, sx, sy, 2, 2, sub_ref[i]);
+        }
+
+        for (i = 0; i < 4; i++) {
+          if (sub_mb_type[i] != GST_H264_CABAC_P_SUB_MB_8X8)
+            dct8x8_allowed = FALSE;
+        }
+
+        for (i = 0; i < 4; i++) {
+          static const guint8 part_coords[4][2] = { {0, 0}, {1, 0}, {0, 1}, {1,
+              1} };
+          static const guint8 part_indices_8x8[1] = { 0 };
+          static const guint8 part_indices_8x4[2] = { 0, 2 };
+          static const guint8 part_indices_4x8[2] = { 0, 1 };
+          static const guint8 part_indices_4x4[4] = { 0, 1, 2, 3 };
+          const guint8 *part_indices = NULL;
+          guint part_count = 0;
+          guint part;
+          gint sx = (i & 1) ? 2 : 0;
+          gint sy = (i & 2) ? 2 : 0;
+
+          switch (sub_mb_type[i]) {
+            case GST_H264_CABAC_P_SUB_MB_8X8:
+              part_indices = part_indices_8x8;
+              part_count = 1;
+              break;
+            case GST_H264_CABAC_P_SUB_MB_8X4:
+              part_indices = part_indices_8x4;
+              part_count = 2;
+              break;
+            case GST_H264_CABAC_P_SUB_MB_4X8:
+              part_indices = part_indices_4x8;
+              part_count = 2;
+              break;
+            case GST_H264_CABAC_P_SUB_MB_4X4:
+              part_indices = part_indices_4x4;
+              part_count = 4;
+              break;
+          }
+
+          for (part = 0; part < part_count; part++) {
+            gint local = part_indices[part];
+            gint px = sx + part_coords[local][0];
+            gint py = sy + part_coords[local][1];
+            gint16 mvd_x;
+            gint16 mvd_y;
+            gint w = 1;
+            gint h = 1;
+
+            if (!gst_h264_parser_decode_cabac_mb_mvd (&cabac, state, mvd_grid,
+                    left_mvd, top_mvd, px, py, &mvd_x, &mvd_y))
+              goto done;
+
+            switch (sub_mb_type[i]) {
+              case GST_H264_CABAC_P_SUB_MB_8X8:
+                w = 2;
+                h = 2;
+                break;
+              case GST_H264_CABAC_P_SUB_MB_8X4:
+                w = 2;
+                h = 1;
+                break;
+              case GST_H264_CABAC_P_SUB_MB_4X8:
+                w = 1;
+                h = 2;
+                break;
+              case GST_H264_CABAC_P_SUB_MB_4X4:
+                w = 1;
+                h = 1;
+                break;
+            }
+
+            gst_h264_parser_fill_mvd_rect (mvd_grid, px, py, w, h, mvd_x,
+                mvd_y);
+          }
+        }
+      } else {
+        guint part;
+        guint part_count = mb_type == GST_H264_CABAC_P_MB_16X16 ? 1 : 2;
+        guint8 part_ref[2] = { 0, 0 };
+
+        for (part = 0; part < part_count; part++) {
+          gint px = 0;
+          gint py = 0;
+          gint w = 4;
+          gint h = 4;
+
+          if (mb_type == GST_H264_CABAC_P_MB_16X8) {
+            py = part == 0 ? 0 : 2;
+            h = 2;
+          } else if (mb_type == GST_H264_CABAC_P_MB_8X16) {
+            px = part == 0 ? 0 : 2;
+            w = 2;
+          }
+
+          if (!gst_h264_parser_decode_cabac_mb_ref (&cabac, state,
+                  gst_h264_parser_left_ref (ref_grid, left_ref, px, py),
+                  gst_h264_parser_top_ref (ref_grid, top_ref, px, py),
+                  slice->num_ref_idx_l0_active_minus1 + 1, &part_ref[part]))
+            goto done;
+          *used_ref_mask_l0 |= 1u << part_ref[part];
+          gst_h264_parser_fill_ref_rect (ref_grid, px, py, w, h, part_ref[part]);
+        }
+
+        for (part = 0; part < part_count; part++) {
+          gint px = 0;
+          gint py = 0;
+          gint w = 4;
+          gint h = 4;
+          gint16 mvd_x;
+          gint16 mvd_y;
+
+          if (mb_type == GST_H264_CABAC_P_MB_16X8) {
+            py = part == 0 ? 0 : 2;
+            h = 2;
+          } else if (mb_type == GST_H264_CABAC_P_MB_8X16) {
+            px = part == 0 ? 0 : 2;
+            w = 2;
+          }
+
+          if (!gst_h264_parser_decode_cabac_mb_mvd (&cabac, state, mvd_grid,
+                  left_mvd, top_mvd, px, py, &mvd_x, &mvd_y))
+            goto done;
+          gst_h264_parser_fill_mvd_rect (mvd_grid, px, py, w, h, mvd_x, mvd_y);
+        }
+      }
+
+      cbp = gst_h264_parser_decode_cabac_mb_cbp_luma (&cabac, state, left_cbp,
+          *top_cbp_mb);
+      cbp |= gst_h264_parser_decode_cabac_mb_cbp_chroma (&cabac, state,
+          left_cbp, *top_cbp_mb) << 4;
+      if (cbp != 0 && !gst_h264_parser_skip_cabac_inter_residual (&cabac, state,
+              left_cbp_ctx, top_cbp_ctx, &cbp, dct8x8_allowed,
+              *top_transform8x8_mb ? 1 : 0,
+              left_transform8x8 ? 1 : 0, luma_nnz, top_luma_nnz_mb,
+              left_luma_nnz, chroma_nnz, top_chroma_u_nnz_mb,
+              left_chroma_u_nnz, top_chroma_v_nnz_mb, left_chroma_v_nnz,
+              last_qscale_nonzero, &qp_delta_nonzero, &transform8x8))
+        goto done;
+finish_mb:
+      last_qscale_nonzero = qp_delta_nonzero;
+    }
+
+    for (x4 = 0; x4 < 4; x4++) {
+      top_ref[x4] = ref_grid[3][x4];
+      top_mvd[x4][0] = mvd_grid[3][x4][0];
+      top_mvd[x4][1] = mvd_grid[3][x4][1];
+      top_luma_nnz_mb[x4] = luma_nnz[3][x4];
+    }
+    for (y4 = 0; y4 < 4; y4++) {
+      left_ref[y4] = ref_grid[y4][3];
+      left_mvd[y4][0] = mvd_grid[y4][3][0];
+      left_mvd[y4][1] = mvd_grid[y4][3][1];
+      left_luma_nnz[y4] = luma_nnz[y4][3];
+    }
+    top_chroma_u_nnz_mb[0] = chroma_nnz[0][1][0];
+    top_chroma_u_nnz_mb[1] = chroma_nnz[0][1][1];
+    top_chroma_v_nnz_mb[0] = chroma_nnz[1][1][0];
+    top_chroma_v_nnz_mb[1] = chroma_nnz[1][1][1];
+    left_chroma_u_nnz[0] = chroma_nnz[0][0][1];
+    left_chroma_u_nnz[1] = chroma_nnz[0][1][1];
+    left_chroma_v_nnz[0] = chroma_nnz[1][0][1];
+    left_chroma_v_nnz[1] = chroma_nnz[1][1][1];
+    *top_non_skip_mb = non_skip ? 1 : 0;
+    *top_transform8x8_mb = transform8x8 ? 1 : 0;
+    *top_chroma_pred_mode_mb = chroma_pred_mode;
+    *top_cbp_mb = cbp;
+    left_chroma_pred_mode = chroma_pred_mode;
+    left_non_skip = non_skip;
+    left_transform8x8 = transform8x8;
+    left_cbp = cbp;
+
+    mb_addr++;
+    mb_x++;
+    if (mb_x >= mb_width) {
+      mb_x = 0;
+      mb_y++;
+      left_non_skip = FALSE;
+      left_transform8x8 = FALSE;
+      left_cbp = 0;
+      memset (left_ref, 0xFF, sizeof (left_ref));
+      memset (left_mvd, 0, sizeof (left_mvd));
+      memset (left_luma_nnz, 0, sizeof (left_luma_nnz));
+      memset (left_chroma_u_nnz, 0, sizeof (left_chroma_u_nnz));
+      memset (left_chroma_v_nnz, 0, sizeof (left_chroma_v_nnz));
+      left_chroma_pred_mode = 0;
+    }
+
+    if (gst_h264_parser_get_cabac_terminate (&cabac))
+      break;
+  }
+
+done:
+  g_free (top_mvd_all);
+  g_free (top_ref_all);
+  g_free (top_chroma_v_nnz);
+  g_free (top_chroma_u_nnz);
+  g_free (top_luma_nnz);
+  g_free (top_chroma_pred_mode);
+  g_free (top_transform8x8);
+  g_free (top_cbp);
+  g_free (top_non_skip);
+  g_free (rbsp);
+  return *used_ref_mask_l0 != 0;
+}
+
+gboolean
+gst_h264_parser_identify_slice_ref_usage (GstH264NalParser * nalparser,
+    GstH264NalUnit * nalu, GstH264SliceHdr * slice, guint32 * used_ref_mask_l0)
+{
+  const GstH264PPS *pps;
+  const GstH264SPS *sps;
+  NalReader nr;
+  guint32 mb_skip_run = 0;
+  guint32 total_mbs;
+  guint32 remaining_mbs;
+
+  (void) nalparser;
+
+  if (used_ref_mask_l0 == NULL || nalu == NULL || slice == NULL || slice->pps == NULL)
+    return FALSE;
+
+  *used_ref_mask_l0 = 0;
+  pps = slice->pps;
+  sps = pps->sequence;
+  if (sps == NULL)
+    return FALSE;
+
+  if (!GST_H264_IS_P_SLICE (slice) && !GST_H264_IS_SP_SLICE (slice))
+    return FALSE;
+  if (slice->field_pic_flag || !sps->frame_mbs_only_flag ||
+      sps->mb_adaptive_frame_field_flag)
+    return FALSE;
+  if (slice->ref_pic_list_modification_flag_l0)
+    return FALSE;
+
+  total_mbs = (sps->pic_width_in_mbs_minus1 + 1) *
+      (sps->pic_height_in_map_units_minus1 + 1);
+  if (slice->first_mb_in_slice >= total_mbs)
+    return FALSE;
+  remaining_mbs = total_mbs - slice->first_mb_in_slice;
+
+  /* Exact by construction: only one list0 reference exists. */
+  if (slice->num_ref_idx_l0_active_minus1 == 0) {
+    *used_ref_mask_l0 = 1u;
+    return TRUE;
+  }
+
+  if (pps->entropy_coding_mode_flag) {
+    /* Minimal FFmpeg-guided CABAC port:
+     * walk frame-coded P/SP slices through skip flags, mb_type/sub_mb_type,
+     * ref_idx_l0, mvd and inter residual syntax so used_ref_mask_l0 survives
+     * coded macroblocks instead of dropping to generic active-list fallback. */
+    return gst_h264_parser_identify_cabac_p_ref_usage (pps, sps, nalu, slice,
+        total_mbs, used_ref_mask_l0);
+  }
+
+  /* Minimal first port of the FFmpeg inter-MB path for CAVLC:
+   * if mb_skip_run consumes the whole slice, every macroblock is an implicit
+   * P-skip using ref_idx_l0 = 0. */
+  nal_reader_init (&nr, nalu->data + nalu->offset + nalu->header_bytes,
+      nalu->size - nalu->header_bytes);
+  if (!nal_reader_skip_long (&nr, slice->header_size))
+    return FALSE;
+  if (!nal_reader_get_ue (&nr, &mb_skip_run))
+    return FALSE;
+
+  if (mb_skip_run == remaining_mbs) {
+    *used_ref_mask_l0 = 1u;
+    return TRUE;
+  }
+
+  return FALSE;
+}
+// Alex: too much details //
 
 /* Free MVC-specific data from subset SPS header */
 static void

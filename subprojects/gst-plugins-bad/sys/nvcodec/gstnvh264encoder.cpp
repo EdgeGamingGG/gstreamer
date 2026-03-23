@@ -87,6 +87,7 @@ enum
   PROP_TUNE,
   PROP_MULTI_PASS,
   PROP_WEIGHTED_PRED,
+  PROP_ENABLE_PTD,
 
   /* encoding config */
   PROP_GOP_SIZE,
@@ -130,12 +131,38 @@ enum
   PROP_AUD,
   PROP_CABAC,
   PROP_REPEAT_SEQUENCE_HEADER,
+
+  /* h264 codec config */
+  PROP_ENABLE_TEMPORAL_SVC,
+  PROP_ENABLE_SCALABILITY_INFO_SEI,
+  PROP_NUM_TEMPORAL_LAYERS,
+  PROP_MAX_TEMPORAL_LAYERS,
+  PROP_DISABLE_SVC_PREFIX_NALU,
+  PROP_HIERARCHICAL_P_FRAMES,
+  PROP_HIERARCHICAL_B_FRAMES,
+  PROP_ADAPTIVE_TRANSFORM_MODE,
+  PROP_FMO_MODE,
+  PROP_ENABLE_LTR,
+  PROP_LTR_NUM_FRAMES,
+  PROP_LTR_TRUST_MODE,
+  PROP_ENABLE_INTRA_REFRESH,
+  PROP_INTRA_REFRESH_PERIOD,
+  PROP_INTRA_REFRESH_CNT,
+  PROP_USE_CONSTRAINED_INTRA_PRED,
+  PROP_SINGLE_SLICE_INTRA_REFRESH,
+  PROP_MAX_NUM_REF_FRAMES,
+  PROP_SLICE_MODE,
+  PROP_SLICE_MODE_DATA,
+  PROP_ENABLE_CONSTRAINED_ENCODING,
+  PROP_NUM_REF_L0,
+  PROP_NUM_REF_L1,
 };
 
 #define DEFAULT_PRESET            GST_NV_ENCODER_PRESET_DEFAULT
 #define DEFAULT_TUNE              GST_NV_ENCODER_TUNE_DEFAULT
 #define DEFAULT_MULTI_PASS        GST_NV_ENCODER_MULTI_PASS_DEFAULT
 #define DEFAULT_WEIGHTED_PRED     FALSE
+#define DEFAULT_ENABLE_PTD        TRUE
 #define DEFAULT_GOP_SIZE          75
 #define DEFAULT_B_FRAMES          0
 #define DEFAULT_RATE_CONTROL      GST_NV_ENCODER_RC_MODE_DEFAULT
@@ -155,6 +182,30 @@ enum
 #define DEFAULT_CONST_QUALITY     0
 #define DEFAULT_AUD               TRUE
 #define DEFAULT_REPEAT_SEQUENCE_HEADER FALSE
+
+#define DEFAULT_ENABLE_TEMPORAL_SVC       FALSE
+#define DEFAULT_ENABLE_SCALABILITY_INFO_SEI FALSE
+#define DEFAULT_NUM_TEMPORAL_LAYERS       1
+#define DEFAULT_MAX_TEMPORAL_LAYERS       0
+#define DEFAULT_DISABLE_SVC_PREFIX_NALU   FALSE
+#define DEFAULT_HIERARCHICAL_P_FRAMES     FALSE
+#define DEFAULT_HIERARCHICAL_B_FRAMES     FALSE
+#define DEFAULT_ADAPTIVE_TRANSFORM_MODE   0
+#define DEFAULT_FMO_MODE                  0
+#define DEFAULT_ENABLE_LTR                FALSE
+#define DEFAULT_LTR_NUM_FRAMES            0
+#define DEFAULT_LTR_TRUST_MODE            0
+#define DEFAULT_ENABLE_INTRA_REFRESH      FALSE
+#define DEFAULT_INTRA_REFRESH_PERIOD      0
+#define DEFAULT_INTRA_REFRESH_CNT         0
+#define DEFAULT_USE_CONSTRAINED_INTRA_PRED FALSE
+#define DEFAULT_SINGLE_SLICE_INTRA_REFRESH FALSE
+#define DEFAULT_MAX_NUM_REF_FRAMES        0
+#define DEFAULT_SLICE_MODE                0
+#define DEFAULT_SLICE_MODE_DATA           0
+#define DEFAULT_ENABLE_CONSTRAINED_ENCODING FALSE
+#define DEFAULT_NUM_REF_L0                0
+#define DEFAULT_NUM_REF_L1                0
 
 typedef struct _GstNvH264Encoder
 {
@@ -180,6 +231,7 @@ typedef struct _GstNvH264Encoder
   GstNvEncoderMultiPass multipass;
   GstNvEncoderTune tune;
   gboolean weighted_pred;
+  gboolean enable_ptd;
 
   gint gop_size;
   guint bframes;
@@ -214,6 +266,31 @@ typedef struct _GstNvH264Encoder
   gboolean aud;
   gboolean cabac;
   gboolean repeat_sequence_header;
+
+  /* h264 codec config */
+  gboolean enable_temporal_svc;
+  gboolean enable_scalability_info_sei;
+  guint num_temporal_layers;
+  guint max_temporal_layers;
+  gboolean disable_svc_prefix_nalu;
+  gboolean hierarchical_p_frames;
+  gboolean hierarchical_b_frames;
+  guint adaptive_transform_mode;
+  guint fmo_mode;
+  gboolean enable_ltr;
+  guint ltr_num_frames;
+  guint ltr_trust_mode;
+  gboolean enable_intra_refresh;
+  guint intra_refresh_period;
+  guint intra_refresh_cnt;
+  gboolean use_constrained_intra_pred;
+  gboolean single_slice_intra_refresh;
+  guint max_num_ref_frames;
+  guint slice_mode;
+  guint slice_mode_data;
+  gboolean enable_constrained_encoding;
+  guint num_ref_l0;
+  guint num_ref_l1;
 } GstNvH264Encoder;
 
 typedef struct _GstNvH264EncoderClass
@@ -378,6 +455,10 @@ gst_nv_h264_encoder_class_init (GstNvH264EncoderClass * klass, gpointer data)
             "Enables Weighted Prediction", DEFAULT_WEIGHTED_PRED,
             conditional_param_flags));
   }
+  g_object_class_install_property (object_class, PROP_ENABLE_PTD,
+      g_param_spec_boolean ("enable-ptd", "Enable PTD",
+          "Enable picture type decision (NV_ENC_INITIALIZE_PARAMS::enablePTD)",
+          DEFAULT_ENABLE_PTD, param_flags));
   g_object_class_install_property (object_class, PROP_GOP_SIZE,
       g_param_spec_int ("gop-size", "GOP size",
           "Number of frames between intra frames (-1 = infinite)",
@@ -602,6 +683,110 @@ gst_nv_h264_encoder_class_init (GstNvH264EncoderClass * klass, gpointer data)
           "Insert sequence headers (SPS/PPS) per IDR",
           DEFAULT_REPEAT_SEQUENCE_HEADER, param_flags));
 
+  /* h264 codec config properties */
+  g_object_class_install_property (object_class, PROP_ENABLE_TEMPORAL_SVC,
+      g_param_spec_boolean ("enable-temporal-svc", "Enable Temporal SVC",
+          "Enable SVC temporal scalability",
+          DEFAULT_ENABLE_TEMPORAL_SVC, param_flags));
+  g_object_class_install_property (object_class, PROP_ENABLE_SCALABILITY_INFO_SEI,
+      g_param_spec_boolean ("enable-scalability-info-sei",
+          "Enable Scalability Info SEI",
+          "Enable scalability information SEI (applies when temporal SVC is enabled)",
+          DEFAULT_ENABLE_SCALABILITY_INFO_SEI, param_flags));
+  g_object_class_install_property (object_class, PROP_NUM_TEMPORAL_LAYERS,
+      g_param_spec_uint ("num-temporal-layers", "Num Temporal Layers",
+          "Number of temporal layers for hierarchical coding",
+          1, 4, DEFAULT_NUM_TEMPORAL_LAYERS, param_flags));
+  g_object_class_install_property (object_class, PROP_MAX_TEMPORAL_LAYERS,
+      g_param_spec_uint ("max-temporal-layers", "Max Temporal Layers",
+          "Maximum temporal layers (0 = driver default)",
+          0, 4, DEFAULT_MAX_TEMPORAL_LAYERS, param_flags));
+  g_object_class_install_property (object_class, PROP_DISABLE_SVC_PREFIX_NALU,
+      g_param_spec_boolean ("disable-svc-prefix-nalu", "Disable SVC Prefix NALU",
+          "Disable SVC prefix NALU",
+          DEFAULT_DISABLE_SVC_PREFIX_NALU, param_flags));
+  g_object_class_install_property (object_class, PROP_HIERARCHICAL_P_FRAMES,
+      g_param_spec_boolean ("hierarchical-p-frames", "Hierarchical P Frames",
+          "Enable hierarchical P frames",
+          DEFAULT_HIERARCHICAL_P_FRAMES, param_flags));
+  g_object_class_install_property (object_class, PROP_HIERARCHICAL_B_FRAMES,
+      g_param_spec_boolean ("hierarchical-b-frames", "Hierarchical B Frames",
+          "Enable hierarchical B frames",
+          DEFAULT_HIERARCHICAL_B_FRAMES, param_flags));
+  g_object_class_install_property (object_class, PROP_ADAPTIVE_TRANSFORM_MODE,
+      g_param_spec_uint ("adaptive-transform-mode", "Adaptive Transform Mode",
+          "Adaptive transform mode (0=auto, 1=disable, 2=enable)",
+          0, 2, DEFAULT_ADAPTIVE_TRANSFORM_MODE, param_flags));
+  g_object_class_install_property (object_class, PROP_FMO_MODE,
+      g_param_spec_uint ("fmo-mode", "FMO Mode",
+          "FMO mode (0=auto, 1=enable, 2=disable)",
+          0, 2, DEFAULT_FMO_MODE, param_flags));
+  g_object_class_install_property (object_class, PROP_ENABLE_LTR,
+      g_param_spec_boolean ("enable-ltr", "Enable LTR",
+          "Enable Long Term Reference frame support",
+          DEFAULT_ENABLE_LTR, param_flags));
+  g_object_class_install_property (object_class, PROP_LTR_NUM_FRAMES,
+      g_param_spec_uint ("ltr-num-frames", "LTR Num Frames",
+          "Number of LTR frames (0 = driver default)",
+          0, G_MAXUINT, DEFAULT_LTR_NUM_FRAMES, param_flags));
+  g_object_class_install_property (object_class, PROP_LTR_TRUST_MODE,
+      g_param_spec_uint ("ltr-trust-mode", "LTR Trust Mode",
+          "LTR trust mode (0 or 1)",
+          0, 1, DEFAULT_LTR_TRUST_MODE, param_flags));
+  g_object_class_install_property (object_class, PROP_ENABLE_INTRA_REFRESH,
+      g_param_spec_boolean ("enable-intra-refresh", "Enable Intra Refresh",
+          "Enable intra refresh",
+          DEFAULT_ENABLE_INTRA_REFRESH, param_flags));
+  g_object_class_install_property (object_class, PROP_INTRA_REFRESH_PERIOD,
+      g_param_spec_uint ("intra-refresh-period", "Intra Refresh Period",
+          "Intra refresh period in number of frames (0 = disable)",
+          0, G_MAXUINT, DEFAULT_INTRA_REFRESH_PERIOD, param_flags));
+  g_object_class_install_property (object_class, PROP_INTRA_REFRESH_CNT,
+      g_param_spec_uint ("intra-refresh-cnt", "Intra Refresh Count",
+          "Number of frames over which intra refresh happens",
+          0, G_MAXUINT, DEFAULT_INTRA_REFRESH_CNT, param_flags));
+  g_object_class_install_property (object_class, PROP_USE_CONSTRAINED_INTRA_PRED,
+      g_param_spec_boolean ("use-constrained-intra-pred",
+          "Use Constrained Intra Prediction",
+          "Enable constrained intra prediction for intra refresh",
+          DEFAULT_USE_CONSTRAINED_INTRA_PRED, param_flags));
+  g_object_class_install_property (object_class, PROP_SINGLE_SLICE_INTRA_REFRESH,
+      g_param_spec_boolean ("single-slice-intra-refresh",
+          "Single Slice Intra Refresh",
+          "Enable single-slice intra refresh",
+          DEFAULT_SINGLE_SLICE_INTRA_REFRESH, param_flags));
+  g_object_class_install_property (object_class, PROP_MAX_NUM_REF_FRAMES,
+      g_param_spec_uint ("max-num-ref-frames", "Max Num Ref Frames",
+          "Maximum number of reference frames (0 = driver default)",
+          0, 16, DEFAULT_MAX_NUM_REF_FRAMES, param_flags));
+  /* NV_ENC_CONFIG_H264::sliceMode integer values are defined by NVENC as:
+   * 0 = macroblocks-per-slice, 1 = bytes-per-slice, 2 = MB-rows-per-slice,
+   * 3 = driver/encoder-determined slicing.
+   * Keep the property description aligned with SDK semantics, because this
+   * text is surfaced via gst-inspect and used as user-facing documentation. */
+  g_object_class_install_property (object_class, PROP_SLICE_MODE,
+      g_param_spec_uint ("slice-mode", "Slice Mode",
+          "Slice mode (0=MB, 1=bytes, 2=MB rows, 3=auto)",
+          0, 3, DEFAULT_SLICE_MODE, param_flags));
+  g_object_class_install_property (object_class, PROP_SLICE_MODE_DATA,
+      g_param_spec_uint ("slice-mode-data", "Slice Mode Data",
+          "Parameter for slice mode (MBs, bytes, MB rows, or desired slice count)",
+          0, G_MAXUINT, DEFAULT_SLICE_MODE_DATA, param_flags));
+  g_object_class_install_property (object_class, PROP_ENABLE_CONSTRAINED_ENCODING,
+      g_param_spec_boolean ("enable-constrained-encoding",
+          "Enable Constrained Encoding",
+          "Enable constrained encoding where each slice in the constrained "
+          "picture is independent of other slices",
+          DEFAULT_ENABLE_CONSTRAINED_ENCODING, param_flags));
+  g_object_class_install_property (object_class, PROP_NUM_REF_L0,
+      g_param_spec_uint ("num-ref-l0", "Num Ref L0",
+          "Number of reference frames in L0 list (0 = auto)",
+          0, 7, DEFAULT_NUM_REF_L0, param_flags));
+  g_object_class_install_property (object_class, PROP_NUM_REF_L1,
+      g_param_spec_uint ("num-ref-l1", "Num Ref L1",
+          "Number of reference frames in L1 list (0 = auto)",
+          0, 7, DEFAULT_NUM_REF_L1, param_flags));
+
   GstPadTemplate *pad_templ = gst_pad_template_new ("sink",
       GST_PAD_SINK, GST_PAD_ALWAYS, cdata->sink_caps);
   GstCaps *doc_caps = nullptr;
@@ -689,6 +874,7 @@ gst_nv_h264_encoder_init (GstNvH264Encoder * self)
   self->tune = DEFAULT_TUNE;
   self->multipass = DEFAULT_MULTI_PASS;
   self->weighted_pred = DEFAULT_WEIGHTED_PRED;
+  self->enable_ptd = DEFAULT_ENABLE_PTD;
   self->gop_size = DEFAULT_GOP_SIZE;
   self->bframes = DEFAULT_B_FRAMES;
   self->rc_mode = DEFAULT_RATE_CONTROL;
@@ -721,6 +907,30 @@ gst_nv_h264_encoder_init (GstNvH264Encoder * self)
   if (klass->device_caps.cabac)
     self->cabac = TRUE;
   self->repeat_sequence_header = DEFAULT_REPEAT_SEQUENCE_HEADER;
+
+  self->enable_temporal_svc = DEFAULT_ENABLE_TEMPORAL_SVC;
+  self->enable_scalability_info_sei = DEFAULT_ENABLE_SCALABILITY_INFO_SEI;
+  self->num_temporal_layers = DEFAULT_NUM_TEMPORAL_LAYERS;
+  self->max_temporal_layers = DEFAULT_MAX_TEMPORAL_LAYERS;
+  self->disable_svc_prefix_nalu = DEFAULT_DISABLE_SVC_PREFIX_NALU;
+  self->hierarchical_p_frames = DEFAULT_HIERARCHICAL_P_FRAMES;
+  self->hierarchical_b_frames = DEFAULT_HIERARCHICAL_B_FRAMES;
+  self->adaptive_transform_mode = DEFAULT_ADAPTIVE_TRANSFORM_MODE;
+  self->fmo_mode = DEFAULT_FMO_MODE;
+  self->enable_ltr = DEFAULT_ENABLE_LTR;
+  self->ltr_num_frames = DEFAULT_LTR_NUM_FRAMES;
+  self->ltr_trust_mode = DEFAULT_LTR_TRUST_MODE;
+  self->enable_intra_refresh = DEFAULT_ENABLE_INTRA_REFRESH;
+  self->intra_refresh_period = DEFAULT_INTRA_REFRESH_PERIOD;
+  self->intra_refresh_cnt = DEFAULT_INTRA_REFRESH_CNT;
+  self->use_constrained_intra_pred = DEFAULT_USE_CONSTRAINED_INTRA_PRED;
+  self->single_slice_intra_refresh = DEFAULT_SINGLE_SLICE_INTRA_REFRESH;
+  self->max_num_ref_frames = DEFAULT_MAX_NUM_REF_FRAMES;
+  self->slice_mode = DEFAULT_SLICE_MODE;
+  self->slice_mode_data = DEFAULT_SLICE_MODE_DATA;
+  self->enable_constrained_encoding = DEFAULT_ENABLE_CONSTRAINED_ENCODING;
+  self->num_ref_l0 = DEFAULT_NUM_REF_L0;
+  self->num_ref_l1 = DEFAULT_NUM_REF_L1;
 
   self->parser = gst_h264_nal_parser_new ();
   self->sei_array = g_array_new (FALSE, FALSE, sizeof (GstH264SEIMessage));
@@ -910,6 +1120,9 @@ gst_nv_h264_encoder_set_property (GObject * object, guint prop_id,
     case PROP_WEIGHTED_PRED:
       update_boolean (self, &self->weighted_pred, value, UPDATE_INIT_PARAM);
       break;
+    case PROP_ENABLE_PTD:
+      update_boolean (self, &self->enable_ptd, value, UPDATE_INIT_PARAM);
+      break;
     case PROP_GOP_SIZE:
       update_int (self, &self->gop_size, value, UPDATE_INIT_PARAM);
       break;
@@ -1010,6 +1223,76 @@ gst_nv_h264_encoder_set_property (GObject * object, guint prop_id,
       update_boolean (self,
           &self->repeat_sequence_header, value, UPDATE_INIT_PARAM);
       break;
+    case PROP_ENABLE_TEMPORAL_SVC:
+      update_boolean (self, &self->enable_temporal_svc, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_ENABLE_SCALABILITY_INFO_SEI:
+      update_boolean (self, &self->enable_scalability_info_sei, value,
+          UPDATE_INIT_PARAM);
+      break;
+    case PROP_NUM_TEMPORAL_LAYERS:
+      update_uint (self, &self->num_temporal_layers, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_MAX_TEMPORAL_LAYERS:
+      update_uint (self, &self->max_temporal_layers, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_DISABLE_SVC_PREFIX_NALU:
+      update_boolean (self, &self->disable_svc_prefix_nalu, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_HIERARCHICAL_P_FRAMES:
+      update_boolean (self, &self->hierarchical_p_frames, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_HIERARCHICAL_B_FRAMES:
+      update_boolean (self, &self->hierarchical_b_frames, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_ADAPTIVE_TRANSFORM_MODE:
+      update_uint (self, &self->adaptive_transform_mode, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_FMO_MODE:
+      update_uint (self, &self->fmo_mode, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_ENABLE_LTR:
+      update_boolean (self, &self->enable_ltr, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_LTR_NUM_FRAMES:
+      update_uint (self, &self->ltr_num_frames, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_LTR_TRUST_MODE:
+      update_uint (self, &self->ltr_trust_mode, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_ENABLE_INTRA_REFRESH:
+      update_boolean (self, &self->enable_intra_refresh, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_INTRA_REFRESH_PERIOD:
+      update_uint (self, &self->intra_refresh_period, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_INTRA_REFRESH_CNT:
+      update_uint (self, &self->intra_refresh_cnt, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_USE_CONSTRAINED_INTRA_PRED:
+      update_boolean (self, &self->use_constrained_intra_pred, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_SINGLE_SLICE_INTRA_REFRESH:
+      update_boolean (self, &self->single_slice_intra_refresh, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_MAX_NUM_REF_FRAMES:
+      update_uint (self, &self->max_num_ref_frames, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_SLICE_MODE:
+      update_uint (self, &self->slice_mode, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_SLICE_MODE_DATA:
+      update_uint (self, &self->slice_mode_data, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_ENABLE_CONSTRAINED_ENCODING:
+      update_boolean (self, &self->enable_constrained_encoding, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_NUM_REF_L0:
+      update_uint (self, &self->num_ref_l0, value, UPDATE_INIT_PARAM);
+      break;
+    case PROP_NUM_REF_L1:
+      update_uint (self, &self->num_ref_l1, value, UPDATE_INIT_PARAM);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -1042,6 +1325,9 @@ gst_nv_h264_encoder_get_property (GObject * object, guint prop_id,
       break;
     case PROP_WEIGHTED_PRED:
       g_value_set_boolean (value, self->weighted_pred);
+      break;
+    case PROP_ENABLE_PTD:
+      g_value_set_boolean (value, self->enable_ptd);
       break;
     case PROP_GOP_SIZE:
       g_value_set_int (value, self->gop_size);
@@ -1135,6 +1421,75 @@ gst_nv_h264_encoder_get_property (GObject * object, guint prop_id,
       break;
     case PROP_REPEAT_SEQUENCE_HEADER:
       g_value_set_boolean (value, self->repeat_sequence_header);
+      break;
+    case PROP_ENABLE_TEMPORAL_SVC:
+      g_value_set_boolean (value, self->enable_temporal_svc);
+      break;
+    case PROP_ENABLE_SCALABILITY_INFO_SEI:
+      g_value_set_boolean (value, self->enable_scalability_info_sei);
+      break;
+    case PROP_NUM_TEMPORAL_LAYERS:
+      g_value_set_uint (value, self->num_temporal_layers);
+      break;
+    case PROP_MAX_TEMPORAL_LAYERS:
+      g_value_set_uint (value, self->max_temporal_layers);
+      break;
+    case PROP_DISABLE_SVC_PREFIX_NALU:
+      g_value_set_boolean (value, self->disable_svc_prefix_nalu);
+      break;
+    case PROP_HIERARCHICAL_P_FRAMES:
+      g_value_set_boolean (value, self->hierarchical_p_frames);
+      break;
+    case PROP_HIERARCHICAL_B_FRAMES:
+      g_value_set_boolean (value, self->hierarchical_b_frames);
+      break;
+    case PROP_ADAPTIVE_TRANSFORM_MODE:
+      g_value_set_uint (value, self->adaptive_transform_mode);
+      break;
+    case PROP_FMO_MODE:
+      g_value_set_uint (value, self->fmo_mode);
+      break;
+    case PROP_ENABLE_LTR:
+      g_value_set_boolean (value, self->enable_ltr);
+      break;
+    case PROP_LTR_NUM_FRAMES:
+      g_value_set_uint (value, self->ltr_num_frames);
+      break;
+    case PROP_LTR_TRUST_MODE:
+      g_value_set_uint (value, self->ltr_trust_mode);
+      break;
+    case PROP_ENABLE_INTRA_REFRESH:
+      g_value_set_boolean (value, self->enable_intra_refresh);
+      break;
+    case PROP_INTRA_REFRESH_PERIOD:
+      g_value_set_uint (value, self->intra_refresh_period);
+      break;
+    case PROP_INTRA_REFRESH_CNT:
+      g_value_set_uint (value, self->intra_refresh_cnt);
+      break;
+    case PROP_USE_CONSTRAINED_INTRA_PRED:
+      g_value_set_boolean (value, self->use_constrained_intra_pred);
+      break;
+    case PROP_SINGLE_SLICE_INTRA_REFRESH:
+      g_value_set_boolean (value, self->single_slice_intra_refresh);
+      break;
+    case PROP_MAX_NUM_REF_FRAMES:
+      g_value_set_uint (value, self->max_num_ref_frames);
+      break;
+    case PROP_SLICE_MODE:
+      g_value_set_uint (value, self->slice_mode);
+      break;
+    case PROP_SLICE_MODE_DATA:
+      g_value_set_uint (value, self->slice_mode_data);
+      break;
+    case PROP_ENABLE_CONSTRAINED_ENCODING:
+      g_value_set_boolean (value, self->enable_constrained_encoding);
+      break;
+    case PROP_NUM_REF_L0:
+      g_value_set_uint (value, self->num_ref_l0);
+      break;
+    case PROP_NUM_REF_L1:
+      g_value_set_uint (value, self->num_ref_l1);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1416,7 +1771,7 @@ gst_nv_h264_encoder_set_format (GstNvEncoder * encoder,
   init_params->maxEncodeWidth = GST_VIDEO_INFO_WIDTH (info);
   init_params->encodeHeight = GST_VIDEO_INFO_HEIGHT (info);
   init_params->maxEncodeHeight = GST_VIDEO_INFO_HEIGHT (info);
-  init_params->enablePTD = TRUE;
+  init_params->enablePTD = self->enable_ptd ? 1 : 0;
   if (dev_caps->async_encoding_support)
     init_params->enableEncodeAsync = 1;
   if (info->fps_d > 0 && info->fps_n > 0) {
@@ -1539,9 +1894,12 @@ gst_nv_h264_encoder_set_format (GstNvEncoder * encoder,
 
   if (self->qp_max >= 0) {
     rc_params->enableMaxQP = TRUE;
-    rc_params->maxQP.qpIntra = self->qp_min;
-    rc_params->maxQP.qpInterP = self->qp_min;
-    rc_params->maxQP.qpInterB = self->qp_min;
+    /* qp-max is the scalar override for all frame types.
+     * Using qp_min here would invert user intent and effectively disable
+     * expected max-QP clamping for CBR/VBR rate control. */
+    rc_params->maxQP.qpIntra = self->qp_max;
+    rc_params->maxQP.qpInterP = self->qp_max;
+    rc_params->maxQP.qpInterB = self->qp_max;
   } else if (self->qp_max_i >= 0) {
     rc_params->enableMaxQP = TRUE;
     rc_params->maxQP.qpIntra = self->qp_max_i;
@@ -1655,6 +2013,31 @@ gst_nv_h264_encoder_set_format (GstNvEncoder * encoder,
   } else {
     h264_config->entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE_AUTOSELECT;
   }
+
+  h264_config->enableTemporalSVC = self->enable_temporal_svc;
+  h264_config->enableScalabilityInfoSEI = self->enable_scalability_info_sei;
+  h264_config->numTemporalLayers = self->num_temporal_layers;
+  h264_config->maxTemporalLayers = self->max_temporal_layers;
+  h264_config->disableSVCPrefixNalu = self->disable_svc_prefix_nalu;
+  h264_config->hierarchicalPFrames = self->hierarchical_p_frames;
+  h264_config->hierarchicalBFrames = self->hierarchical_b_frames;
+  h264_config->adaptiveTransformMode =
+      (NV_ENC_H264_ADAPTIVE_TRANSFORM_MODE) self->adaptive_transform_mode;
+  h264_config->fmoMode = (NV_ENC_H264_FMO_MODE) self->fmo_mode;
+  h264_config->enableLTR = self->enable_ltr;
+  h264_config->ltrNumFrames = self->ltr_num_frames;
+  h264_config->ltrTrustMode = self->ltr_trust_mode;
+  h264_config->enableIntraRefresh = self->enable_intra_refresh;
+  h264_config->intraRefreshPeriod = self->intra_refresh_period;
+  h264_config->intraRefreshCnt = self->intra_refresh_cnt;
+  h264_config->useConstrainedIntraPred = self->use_constrained_intra_pred;
+  h264_config->singleSliceIntraRefresh = self->single_slice_intra_refresh;
+  h264_config->maxNumRefFrames = self->max_num_ref_frames;
+  h264_config->sliceMode = self->slice_mode;
+  h264_config->sliceModeData = self->slice_mode_data;
+  h264_config->enableConstrainedEncoding = self->enable_constrained_encoding;
+  h264_config->numRefL0 = (NV_ENC_NUM_REF_FRAMES) self->num_ref_l0;
+  h264_config->numRefL1 = (NV_ENC_NUM_REF_FRAMES) self->num_ref_l1;
 
   GstVideoColorimetry cinfo;
   switch (GST_VIDEO_INFO_FORMAT (info)) {

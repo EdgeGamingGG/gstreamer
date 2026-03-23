@@ -434,6 +434,7 @@ typedef enum
 typedef struct _GstH264NalParser              GstH264NalParser;
 
 typedef struct _GstH264NalUnit                GstH264NalUnit;
+typedef struct _GstH264NalUnitExtensionSVC    GstH264NalUnitExtensionSVC;
 typedef struct _GstH264NalUnitExtensionMVC    GstH264NalUnitExtensionMVC;
 
 typedef struct _GstH264SPSExtMVCView          GstH264SPSExtMVCView;
@@ -465,6 +466,36 @@ typedef struct _GstH264ContentLightLevel        GstH264ContentLightLevel;
 typedef struct _GstH264SEIUnhandledPayload    GstH264SEIUnhandledPayload;
 typedef struct _GstH264SEIMessage             GstH264SEIMessage;
 typedef struct _GstH264DecoderConfigRecord    GstH264DecoderConfigRecord;
+
+/**
+ * GstH264NalUnitExtensionSVC:
+ * @idr_flag: If equal to 1, specifies that the current access unit is an IDR
+ *   access unit
+ * @priority_id: The priority identifier for the NAL unit
+ * @no_inter_layer_pred_flag: Whether inter-layer prediction is disabled
+ * @dependency_id: The dependency identifier for the NAL unit
+ * @quality_id: The quality identifier for the NAL unit
+ * @temporal_id: The temporal identifier for the NAL unit
+ * @use_ref_base_pic_flag: Whether reference base pictures are used
+ * @discardable_flag: Whether this access unit is discardable
+ * @output_flag: Whether this access unit should be output
+ * @reserved_three_2bits: Reserved 2-bit field from Annex G
+ *
+ * Since: 1.26
+ */
+struct _GstH264NalUnitExtensionSVC
+{
+  guint8 idr_flag;
+  guint8 priority_id;
+  guint8 no_inter_layer_pred_flag;
+  guint8 dependency_id;
+  guint8 quality_id;
+  guint8 temporal_id;
+  guint8 use_ref_base_pic_flag;
+  guint8 discardable_flag;
+  guint8 output_flag;
+  guint8 reserved_three_2bits;
+};
 
 /**
  * GstH264NalUnitExtensionMVC:
@@ -539,6 +570,7 @@ struct _GstH264NalUnit
   guint8 header_bytes;
   guint8 extension_type;
   union {
+    GstH264NalUnitExtensionSVC svc;
     GstH264NalUnitExtensionMVC mvc;
   } extension;
 };
@@ -1440,6 +1472,7 @@ struct _GstH264NalParser
   GstH264PPS pps[GST_H264_MAX_PPS_COUNT];
   GstH264SPS *last_sps;
   GstH264PPS *last_pps;
+  gboolean temporal_sps_fixup;
 };
 
 GST_CODEC_PARSERS_API
@@ -1477,6 +1510,13 @@ GST_CODEC_PARSERS_API
 GstH264ParserResult gst_h264_parser_parse_slice_hdr   (GstH264NalParser *nalparser, GstH264NalUnit *nalu,
                                                        GstH264SliceHdr *slice, gboolean parse_pred_weight_table,
                                                        gboolean parse_dec_ref_pic_marking);
+
+GST_CODEC_PARSERS_API
+gboolean            gst_h264_parser_identify_slice_ref_usage
+                                                      (GstH264NalParser * nalparser,
+                                                       GstH264NalUnit * nalu,
+                                                       GstH264SliceHdr * slice,
+                                                       guint32 * used_ref_mask_l0);
 
 GST_CODEC_PARSERS_API
 GstH264ParserResult gst_h264_parser_parse_subset_sps  (GstH264NalParser *nalparser, GstH264NalUnit *nalu,

@@ -77,6 +77,8 @@ struct _TransportStream
 
   GstElement               *reddec;
   GList                    *fecdecs;
+
+  gint                      rtpbin_sendbin_deferred_session_id; /* -1 = not deferred */
 };
 
 struct _TransportStreamClass

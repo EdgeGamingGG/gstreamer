@@ -5004,6 +5004,8 @@ _build_fec_encoder (GstWebRTCBin * webrtc, WebRTCTransceiver * trans)
   gst_element_add_pad (ret, ghost);
   ghost = NULL;
 
+  trans->fec_bin = ret;
+
   return ret;
 }
 
@@ -5078,6 +5080,37 @@ connect_rtpbin_with_sendbin (GstWebRTCBin * webrtc, guint session_id,
       stream->transport, &aux_sender);
   gboolean aux_success = FALSE;
   gchar *rtp_pad_name = g_strdup_printf ("send_rtp_src_%u", session_id);
+
+  /* Find the FEC encoder bin for this session's transceiver (non-bundle).
+   * When present, insert it between rtpbin output and transport so that
+   * rtprtxsend (inside rtpbin) retransmits pre-FEC packets. */
+  GstElement *fec_bin = NULL;
+  {
+    GstWebRTCRTPTransceiver *rtp_trans =
+        _find_transceiver_for_mline (webrtc, session_id);
+    if (rtp_trans) {
+      WebRTCTransceiver *trans = WEBRTC_TRANSCEIVER (rtp_trans);
+      fec_bin = trans->fec_bin;
+    }
+  }
+
+  /* Build the chain: rtpbin → [fec_bin] → [aux_sender] → transport */
+  const char *prev_element_src = rtp_pad_name;
+  GstElement *prev_element = GST_ELEMENT (webrtc->rtpbin);
+
+  /* Insert FEC encoder if available */
+  if (fec_bin) {
+    if (!gst_element_link_pads (prev_element, prev_element_src,
+            fec_bin, "sink")) {
+      GST_ERROR_OBJECT (webrtc,
+          "Unable to link FEC encoder after rtpbin. Skipping FEC.");
+      fec_bin = NULL;
+    } else {
+      prev_element = fec_bin;
+      prev_element_src = "src";
+    }
+  }
+
   if (aux_sender) {
     gst_object_ref_sink (aux_sender);
     if (!gst_bin_add (GST_BIN (webrtc), aux_sender)) {
@@ -5087,20 +5120,19 @@ connect_rtpbin_with_sendbin (GstWebRTCBin * webrtc, guint session_id,
       goto aux_done;
     }
     gst_element_sync_state_with_parent (aux_sender);
-    if (!gst_element_link_pads (GST_ELEMENT (webrtc->rtpbin), rtp_pad_name,
+    if (!gst_element_link_pads (prev_element, prev_element_src,
             aux_sender, "sink")) {
       GST_ERROR_OBJECT (webrtc,
-          "Unable to link aux_sender %" GST_PTR_FORMAT " to %" GST_PTR_FORMAT
-          ". Skipping it.", webrtc->rtpbin, aux_sender);
+          "Unable to link aux_sender %" GST_PTR_FORMAT ". Skipping it.",
+          aux_sender);
       goto aux_done;
     }
     if (!gst_element_link_pads (aux_sender, "src",
             GST_ELEMENT (stream->send_bin), "rtp_sink")) {
-      gst_element_unlink_pads (GST_ELEMENT (webrtc->rtpbin), rtp_pad_name,
+      gst_element_unlink_pads (prev_element, prev_element_src,
           aux_sender, "sink");
       GST_ERROR_OBJECT (webrtc,
-          "Unable to link %" GST_PTR_FORMAT " to aux sender %" GST_PTR_FORMAT
-          ". Skipping it.", aux_sender, stream->send_bin);
+          "Unable to link aux sender to send bin. Skipping it.");
       goto aux_done;
     }
     aux_success = TRUE;
@@ -5108,7 +5140,7 @@ connect_rtpbin_with_sendbin (GstWebRTCBin * webrtc, guint session_id,
     gst_clear_object (&aux_sender);
   }
   if (!aux_success) {
-    if (!gst_element_link_pads (GST_ELEMENT (webrtc->rtpbin), rtp_pad_name,
+    if (!gst_element_link_pads (prev_element, prev_element_src,
             GST_ELEMENT (stream->send_bin), "rtp_sink"))
       g_warn_if_reached ();
   }
@@ -5211,6 +5243,53 @@ _set_internal_rtpbin_element_props_from_stream (GstWebRTCBin * webrtc,
         }
         g_object_set (trans->redenc, "pt", red_pt, "allow-no-red-blocks",
             always_produce, NULL);
+
+        /* Find the primary RTX PT for this mline so redenc passes RTX
+         * packets through unchanged (no RED wrapping). The RTX PT for
+         * the primary media codec is the one with apt matching the
+         * media codec PT. */
+        {
+          guint j;
+          gint media_codec_pt = -1;
+          gint rtx_pt_for_media = -1;
+
+          /* First find the primary media PT */
+          for (j = 0; j < stream->ptmap->len; j++) {
+            PtMapItem *pitem = &g_array_index (stream->ptmap, PtMapItem, j);
+            if (pitem->media_idx == rtp_trans->mline && pitem->caps) {
+              GstStructure *ps = gst_caps_get_structure (pitem->caps, 0);
+              const gchar *enc = gst_structure_get_string (ps, "encoding-name");
+              if (enc && g_strcmp0 (enc, "RED") != 0
+                  && g_strcmp0 (enc, "ULPFEC") != 0
+                  && g_strcmp0 (enc, "RTX") != 0) {
+                media_codec_pt = pitem->pt;
+                break;
+              }
+            }
+          }
+
+          /* Then find the RTX PT whose apt matches the media codec PT */
+          if (media_codec_pt >= 0) {
+            gchar apt_str[8];
+            g_snprintf (apt_str, sizeof (apt_str), "%d", media_codec_pt);
+            for (j = 0; j < stream->ptmap->len; j++) {
+              PtMapItem *pitem = &g_array_index (stream->ptmap, PtMapItem, j);
+              if (pitem->media_idx == rtp_trans->mline && pitem->caps) {
+                GstStructure *ps = gst_caps_get_structure (pitem->caps, 0);
+                const gchar *enc = gst_structure_get_string (ps, "encoding-name");
+                const gchar *apt = gst_structure_get_string (ps, "apt");
+                if (enc && g_strcmp0 (enc, "RTX") == 0
+                    && apt && g_strcmp0 (apt, apt_str) == 0) {
+                  rtx_pt_for_media = pitem->pt;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (rtx_pt_for_media >= 0)
+            g_object_set (trans->redenc, "exclude-pt", rtx_pt_for_media, NULL);
+        }
       }
 
       if (trans->local_rtx_ssrc_map) {
@@ -5299,15 +5378,13 @@ _connect_input_stream (GstWebRTCBin * webrtc, GstWebRTCBinPad * pad)
   gst_bin_add (GST_BIN (webrtc), fec_encoder);
   gst_element_sync_state_with_parent (fec_encoder);
 
-  sinkpad = gst_element_get_static_pad (fec_encoder, "sink");
-  if (gst_pad_link (srcpad, sinkpad) != GST_PAD_LINK_OK)
-    g_warn_if_reached ();
-  gst_clear_object (&srcpad);
-  gst_clear_object (&sinkpad);
   sinkpad = gst_element_get_static_pad (clocksync, "sink");
-  srcpad = gst_element_get_static_pad (fec_encoder, "src");
 
   if (!webrtc->rtpfunnel) {
+    /* Non-bundle: link clocksync directly to rtpbin, deferring FEC encoder
+     * insertion to connect_rtpbin_with_sendbin so that rtprtxsend (inside
+     * rtpbin) stores pre-FEC packets and retransmits raw H.264 (PT 99).
+     * This avoids the libwebrtc bug where RTX-for-RED (PT 100) is ignored. */
     rtp_templ =
         _find_pad_template (webrtc->rtpbin, GST_PAD_SINK, GST_PAD_REQUEST,
         "send_rtp_sink_%u");
@@ -5322,14 +5399,25 @@ _connect_input_stream (GstWebRTCBin * webrtc, GstWebRTCBinPad * pad)
 
     connect_rtpbin_with_sendbin (webrtc, pad->trans->mline, trans->stream);
   } else {
-    gchar *pad_name = g_strdup_printf ("sink_%u", pad->trans->mline);
+    /* Bundle: link clocksync directly to funnel, deferring FEC encoder
+     * insertion to connect_rtpbin_with_sendbin (same as non-bundle path).
+     * This places rtprtxsend (inside rtpbin) BEFORE the FEC encoder, so
+     * RTX retransmits raw H.264 (PT 99) instead of RED-wrapped (PT 100). */
+    gchar *funnel_pad_name = g_strdup_printf ("sink_%u", pad->trans->mline);
     GstPad *funnel_sinkpad =
-        gst_element_request_pad_simple (webrtc->rtpfunnel, pad_name);
+        gst_element_request_pad_simple (webrtc->rtpfunnel, funnel_pad_name);
 
     gst_pad_link (srcpad, funnel_sinkpad);
 
-    g_free (pad_name);
+    g_free (funnel_pad_name);
     gst_object_unref (funnel_sinkpad);
+
+    if (trans->stream->rtpbin_sendbin_deferred_session_id >= 0) {
+      connect_rtpbin_with_sendbin (webrtc,
+          (guint) trans->stream->rtpbin_sendbin_deferred_session_id,
+          trans->stream);
+      trans->stream->rtpbin_sendbin_deferred_session_id = -1;
+    }
   }
 
   gst_ghost_pad_set_target (GST_GHOST_PAD (pad), sinkpad);
@@ -6129,7 +6217,10 @@ _connect_rtpfunnel (GstWebRTCBin * webrtc, guint session_id, GError ** error)
   gst_object_unref (srcpad);
   gst_object_unref (rtp_sink);
 
-  connect_rtpbin_with_sendbin (webrtc, session_id, stream);
+  /* Defer connect_rtpbin_with_sendbin to _connect_input_stream so the FEC
+   * encoder can be placed AFTER rtprtxsend (inside rtpbin). This ensures
+   * RTX retransmits raw H.264 (PT 99) instead of RED-wrapped (PT 100). */
+  stream->rtpbin_sendbin_deferred_session_id = session_id;
 
 done:
   return TRUE;
@@ -7716,8 +7807,9 @@ on_rtpbin_request_aux_sender (GstElement * rtpbin, guint session_id,
 
   ret = gst_bin_new (NULL);
   rtx = gst_element_factory_make ("rtprtxsend", NULL);
-  /* XXX: allow control from outside? */
-  g_object_set (rtx, "max-size-packets", 500, NULL);
+  /* Keep a deeper retransmission history so NACK repair remains effective
+   * under higher RTT and burst loss. */
+  g_object_set (rtx, "max-size-packets", 3000, NULL);
 
   if (!gst_bin_add (GST_BIN (ret), rtx))
     g_warn_if_reached ();

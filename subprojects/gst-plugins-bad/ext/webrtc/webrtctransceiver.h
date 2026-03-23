@@ -61,6 +61,7 @@ struct _WebRTCTransceiver
   GstElement               *ulpfecdec;
   GstElement               *ulpfecenc;
   GstElement               *redenc;
+  GstElement               *fec_bin;
 };
 
 struct _WebRTCTransceiverClass

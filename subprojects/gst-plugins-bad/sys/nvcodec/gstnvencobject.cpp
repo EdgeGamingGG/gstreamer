@@ -132,6 +132,7 @@ struct GstNvEncTask : public GstMiniObject
   guint seq_num;
 
   GArray *sei_payload;
+  GstNvEncH264PtdDecision h264_ptd = { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0 };
 };
 
 GST_DEFINE_MINI_OBJECT_TYPE (GstNvEncTask, gst_nv_enc_task);
@@ -429,6 +430,7 @@ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
   guint retry_count = 0;
   const guint retry_threshold = 100;
   NV_ENC_PIC_PARAMS params = { 0, };
+  GstNvEncH264PtdDecision h264_ptd = { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0 };
 
   std::unique_lock <std::mutex> lk (lock_);
 
@@ -473,8 +475,23 @@ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
     }
   }
 
+  if (codec_ == GST_NV_ENC_CODEC_H264 &&
+      gst_nv_enc_task_get_h264_ptd_decision (task, &h264_ptd) && h264_ptd.valid) {
+    params.pictureType = h264_ptd.picture_type;
+    params.codecPicParams.h264PicParams.displayPOCSyntax =
+        h264_ptd.display_poc_syntax;
+    params.codecPicParams.h264PicParams.refPicFlag = h264_ptd.ref_pic_flag;
+    params.encodePicFlags |= h264_ptd.encode_pic_flags;
+
+    GST_LOG_ID (id_.c_str (),
+        "Apply H264 PTD decision frame=%u type=%d ref=%u poc=%u tl=%u flags=0x%x",
+        codec_frame->system_frame_number, (gint) h264_ptd.picture_type,
+        h264_ptd.ref_pic_flag, h264_ptd.display_poc_syntax,
+        h264_ptd.temporal_layer, h264_ptd.encode_pic_flags);
+  }
+
   if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (codec_frame))
-    params.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+    params.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
 
   do {
     DeviceLock ();
@@ -964,6 +981,12 @@ GstNvEncObject::AcquireTask (GstNvEncTask ** task, bool force)
 
   new_task->object = shared_from_this ();
   g_array_set_size (new_task->sei_payload, 0);
+  new_task->h264_ptd.valid = FALSE;
+  new_task->h264_ptd.picture_type = NV_ENC_PIC_TYPE_P;
+  new_task->h264_ptd.display_poc_syntax = 0;
+  new_task->h264_ptd.ref_pic_flag = 1;
+  new_task->h264_ptd.temporal_layer = 0;
+  new_task->h264_ptd.encode_pic_flags = 0;
 
   *task = new_task;
 
@@ -1188,6 +1211,28 @@ GArray *
 gst_nv_enc_task_get_sei_payload (GstNvEncTask * task)
 {
   return task->sei_payload;
+}
+
+void
+gst_nv_enc_task_set_h264_ptd_decision (GstNvEncTask * task,
+    const GstNvEncH264PtdDecision * decision)
+{
+  g_return_if_fail (task);
+  g_return_if_fail (decision);
+
+  task->h264_ptd = *decision;
+}
+
+gboolean
+gst_nv_enc_task_get_h264_ptd_decision (GstNvEncTask * task,
+    GstNvEncH264PtdDecision * decision)
+{
+  g_return_val_if_fail (task, FALSE);
+  g_return_val_if_fail (decision, FALSE);
+
+  *decision = task->h264_ptd;
+
+  return task->h264_ptd.valid;
 }
 
 NVENCSTATUS

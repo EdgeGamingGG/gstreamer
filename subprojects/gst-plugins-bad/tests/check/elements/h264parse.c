@@ -1548,6 +1548,59 @@ GST_START_TEST (test_parse_sei_userdefinedunregistered)
 
 GST_END_TEST;
 
+GST_START_TEST (test_parse_svc_prefix_and_slice_ext)
+{
+  GstHarness *h;
+  GstBuffer *buf;
+  GstBuffer *out;
+  GstCustomMeta *meta;
+  GstStructure *s;
+  guint temporal_id = 0;
+  gint display_poc = -1;
+  static const guint8 h264_svc_stream[] = {
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x4d, 0x40, 0x15,
+    0xec, 0xa4, 0xbf, 0x2e, 0x02, 0x20, 0x00, 0x00,
+    0x03, 0x00, 0x2e, 0xe6, 0xb2, 0x80, 0x01, 0xe2,
+    0xc5, 0xb2, 0xc0,
+    0x00, 0x00, 0x00, 0x01, 0x68, 0xeb, 0xec, 0xb2,
+    0x00, 0x00, 0x00, 0x01, 0x6e, 0xc0, 0x80, 0x4f,
+    0x00, 0x00, 0x00, 0x01, 0x74, 0xc0, 0x80, 0x4f,
+    0x88, 0x84, 0x00, 0x10, 0xff, 0xfe, 0xf6, 0xf0,
+    0xfe, 0x05, 0x36, 0x56, 0x04, 0x50, 0x96, 0x7b,
+    0x3f, 0x53, 0xe1
+  };
+
+  h = gst_harness_new ("h264parse");
+  gst_harness_set_caps_str (h,
+      "video/x-h264, stream-format=(string)byte-stream",
+      "video/x-h264, stream-format=(string)byte-stream, parsed=(boolean)true, "
+      "alignment=(string)au");
+
+  buf = gst_buffer_new_wrapped_full (GST_MEMORY_FLAG_READONLY,
+      (gpointer) h264_svc_stream, sizeof (h264_svc_stream), 0,
+      sizeof (h264_svc_stream), NULL, NULL);
+  fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
+
+  out = gst_harness_pull (h);
+  fail_unless (out != NULL);
+  fail_unless (!GST_BUFFER_FLAG_IS_SET (out, GST_BUFFER_FLAG_DELTA_UNIT));
+
+  meta = gst_buffer_get_custom_meta (out, "GstH264TemporalMeta");
+  fail_unless (meta != NULL);
+
+  s = gst_custom_meta_get_structure (meta);
+  fail_unless (s != NULL);
+  fail_unless (gst_structure_get_uint (s, "temporal-id", &temporal_id));
+  fail_unless (gst_structure_get_int (s, "display-poc", &display_poc));
+  fail_unless_equals_int (temporal_id, 2);
+  fail_unless (display_poc >= 0);
+
+  gst_buffer_unref (out);
+  gst_harness_teardown (h);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_parse_to_avc3_without_sps)
 {
   GstHarness *h;
@@ -1706,6 +1759,7 @@ main (int argc, char **argv)
     tcase_add_test (tc_chain, test_parse_skip_to_4bytes_sc);
     tcase_add_test (tc_chain, test_parse_aud_insert);
     tcase_add_test (tc_chain, test_parse_sei_userdefinedunregistered);
+  tcase_add_test (tc_chain, test_parse_svc_prefix_and_slice_ext);
     tcase_add_test (tc_chain, test_parse_to_avc3_without_sps);
     nf += gst_check_run_suite (s, "h264parse", __FILE__);
   }

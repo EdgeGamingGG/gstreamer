@@ -39,12 +39,15 @@ GST_DEBUG_CATEGORY (h264_parse_debug);
 
 #define DEFAULT_CONFIG_INTERVAL      (0)
 #define DEFAULT_UPDATE_TIMECODE       FALSE
+#define DEFAULT_TEMPORAL_SPS_FIXUP    FALSE
+#define GST_H264_TEMPORAL_META_NAME "GstH264TemporalMeta"
 
 enum
 {
   PROP_0,
   PROP_CONFIG_INTERVAL,
   PROP_UPDATE_TIMECODE,
+  PROP_TEMPORAL_SPS_FIXUP,
 };
 
 enum
@@ -127,6 +130,10 @@ static gboolean gst_h264_parse_src_event (GstBaseParse * parse,
     GstEvent * event);
 static void gst_h264_parse_update_src_caps (GstH264Parse * h264parse,
     GstCaps * caps);
+static void gst_h264_parse_capture_picture_info (GstH264Parse * h264parse,
+    const GstH264NalUnit * nalu, const GstH264SliceHdr * slice);
+static void gst_h264_parse_add_temporal_meta (GstH264Parse * h264parse,
+    GstBuffer * buffer);
 
 static void
 gst_h264_parse_class_init (GstH264ParseClass * klass)
@@ -173,6 +180,13 @@ gst_h264_parse_class_init (GstH264ParseClass * klass)
           "VUI and pic_struct_present_flag of VUI must be non-zero",
           DEFAULT_UPDATE_TIMECODE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_TEMPORAL_SPS_FIXUP,
+      g_param_spec_boolean ("temporal-sps-fixup",
+          "Temporal SPS Fixup",
+          "Rewrite temporal-input SPS max_num_ref_frames for decoder compatibility",
+          DEFAULT_TEMPORAL_SPS_FIXUP,
+          G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+
   /* Override BaseParse vfuncs */
   parse_class->start = GST_DEBUG_FUNCPTR (gst_h264_parse_start);
   parse_class->stop = GST_DEBUG_FUNCPTR (gst_h264_parse_stop);
@@ -205,6 +219,7 @@ gst_h264_parse_init (GstH264Parse * h264parse)
   h264parse->aud_needed = TRUE;
   h264parse->aud_insert = TRUE;
   h264parse->update_timecode = DEFAULT_UPDATE_TIMECODE;
+  h264parse->temporal_sps_fixup = DEFAULT_TEMPORAL_SPS_FIXUP;
 }
 
 static void
@@ -242,6 +257,9 @@ gst_h264_parse_reset_frame (GstH264Parse * h264parse)
   h264parse->have_sps_in_frame = FALSE;
   h264parse->have_pps_in_frame = FALSE;
   h264parse->have_aud_in_frame = FALSE;
+  h264parse->have_pending_svc_prefix = FALSE;
+  memset (&h264parse->pending_svc_prefix, 0, sizeof (h264parse->pending_svc_prefix));
+  memset (&h264parse->picture_info, 0, sizeof (h264parse->picture_info));
   gst_adapter_clear (h264parse->frame_out);
   gst_video_clear_user_data (&h264parse->user_data, FALSE);
   gst_video_clear_user_data_unregistered (&h264parse->user_data_unregistered,
@@ -282,6 +300,13 @@ gst_h264_parse_reset_stream_info (GstH264Parse * h264parse)
   h264parse->push_codec = FALSE;
   h264parse->first_frame = TRUE;
   h264parse->ignore_vui_fps = FALSE;
+  h264parse->prev_poc_msb = 0;
+  h264parse->prev_poc_lsb = 0;
+  h264parse->prev_frame_num = 0;
+  h264parse->prev_frame_num_offset = 0;
+  h264parse->have_prev_ref_pic_order = FALSE;
+  h264parse->have_prev_frame_num = FALSE;
+  h264parse->saw_nonref_poc_interleave = FALSE;
 
   gst_buffer_replace (&h264parse->codec_data, NULL);
   gst_buffer_replace (&h264parse->codec_data_in, NULL);
@@ -298,6 +323,327 @@ gst_h264_parse_reset_stream_info (GstH264Parse * h264parse)
 
   gst_video_content_light_level_init (&h264parse->content_light_level);
   h264parse->content_light_level_state = GST_H264_PARSE_SEI_EXPIRED;
+}
+
+static gboolean
+gst_h264_parse_drop_temporal_meta (GstBuffer * buffer, GstMeta ** meta,
+    gpointer user_data)
+{
+  if (gst_meta_info_is_custom ((*meta)->info) &&
+      gst_custom_meta_has_name ((GstCustomMeta *) * meta,
+          GST_H264_TEMPORAL_META_NAME)) {
+    *meta = NULL;
+  }
+
+  return TRUE;
+}
+
+static void
+gst_h264_parse_ensure_temporal_meta_registered (void)
+{
+  static gsize init_once = 0;
+
+  if (g_once_init_enter (&init_once)) {
+    gst_meta_register_custom_simple (GST_H264_TEMPORAL_META_NAME);
+    g_once_init_leave (&init_once, 1);
+  }
+}
+
+static gint32
+gst_h264_parse_compute_frame_num_offset (GstH264Parse * h264parse,
+    const GstH264SPS * sps, guint16 frame_num, gboolean is_idr)
+{
+  if (is_idr || !h264parse->have_prev_frame_num)
+    return 0;
+
+  if (h264parse->prev_frame_num > frame_num)
+    return h264parse->prev_frame_num_offset + sps->max_frame_num;
+
+  return h264parse->prev_frame_num_offset;
+}
+
+static gint32
+gst_h264_parse_compute_display_poc (GstH264Parse * h264parse,
+    const GstH264NalUnit * nalu, const GstH264SliceHdr * slice,
+    gint32 frame_num_offset)
+{
+  const GstH264SPS *sps = slice->pps->sequence;
+  gboolean is_idr = nalu->idr_pic_flag != 0;
+  gboolean is_ref = nalu->ref_idc != 0;
+  guint prev_poc_lsb = h264parse->have_prev_ref_pic_order ?
+      h264parse->prev_poc_lsb : 0;
+  gint32 prev_poc_msb = h264parse->have_prev_ref_pic_order ?
+      h264parse->prev_poc_msb : 0;
+
+  switch (sps->pic_order_cnt_type) {
+    case 0:
+    {
+      gint32 poc_msb;
+      gint32 max_poc_lsb;
+
+      if (is_idr)
+        return 0;
+
+      max_poc_lsb = 1 << (sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
+      if (slice->pic_order_cnt_lsb < prev_poc_lsb &&
+          (prev_poc_lsb - slice->pic_order_cnt_lsb) >= (max_poc_lsb >> 1)) {
+        poc_msb = prev_poc_msb + max_poc_lsb;
+      } else if (slice->pic_order_cnt_lsb > prev_poc_lsb &&
+          (slice->pic_order_cnt_lsb - prev_poc_lsb) > (max_poc_lsb >> 1)) {
+        poc_msb = prev_poc_msb - max_poc_lsb;
+      } else {
+        poc_msb = prev_poc_msb;
+      }
+
+      return poc_msb + slice->pic_order_cnt_lsb;
+    }
+    case 1:
+    {
+      gint32 abs_frame_num = frame_num_offset + slice->frame_num;
+      gint32 expected_poc = 0;
+      guint i;
+
+      if (is_idr)
+        return 0;
+
+      if (!is_ref && abs_frame_num > 0)
+        abs_frame_num--;
+
+      if (abs_frame_num > 0 && sps->num_ref_frames_in_pic_order_cnt_cycle > 0) {
+        gint32 poc_cycle_cnt =
+            (abs_frame_num - 1) / sps->num_ref_frames_in_pic_order_cnt_cycle;
+        gint32 frame_num_in_cycle =
+            (abs_frame_num - 1) % sps->num_ref_frames_in_pic_order_cnt_cycle;
+
+        for (i = 0; i < sps->num_ref_frames_in_pic_order_cnt_cycle; i++)
+          expected_poc += sps->offset_for_ref_frame[i];
+        expected_poc *= poc_cycle_cnt;
+        for (i = 0; i <= (guint) frame_num_in_cycle; i++)
+          expected_poc += sps->offset_for_ref_frame[i];
+      }
+
+      if (!is_ref)
+        expected_poc += sps->offset_for_non_ref_pic;
+
+      return expected_poc + slice->delta_pic_order_cnt[0];
+    }
+    case 2:
+    {
+      gint32 abs_frame_num;
+
+      if (is_idr)
+        return 0;
+
+      abs_frame_num = frame_num_offset + slice->frame_num;
+      if (is_ref)
+        return 2 * abs_frame_num;
+
+      return (2 * abs_frame_num) - 1;
+    }
+    default:
+      break;
+  }
+
+  return frame_num_offset + slice->frame_num;
+}
+
+static gboolean
+gst_h264_parse_slice_has_mmco5 (const GstH264SliceHdr * slice)
+{
+  guint i;
+
+  if (!slice->dec_ref_pic_marking.adaptive_ref_pic_marking_mode_flag)
+    return FALSE;
+
+  for (i = 0; i < slice->dec_ref_pic_marking.n_ref_pic_marking; i++) {
+    if (slice->dec_ref_pic_marking.ref_pic_marking[i].
+        memory_management_control_operation == 5)
+      return TRUE;
+  }
+
+  return FALSE;
+}
+
+static const gchar *
+gst_h264_parse_picture_type_name (const GstH264ParsePictureInfo * info)
+{
+  if (info->is_idr)
+    return "idr";
+
+  switch (info->slice_type % 5) {
+    case GST_H264_I_SLICE:
+      return "i";
+    case GST_H264_B_SLICE:
+      return "b";
+    case GST_H264_SP_SLICE:
+      return "sp";
+    case GST_H264_SI_SLICE:
+      return "si";
+    case GST_H264_P_SLICE:
+    default:
+      return "p";
+  }
+}
+
+static void
+gst_h264_parse_capture_picture_info (GstH264Parse * h264parse,
+    const GstH264NalUnit * nalu, const GstH264SliceHdr * slice)
+{
+  const GstH264SPS *sps;
+  GstH264ParsePictureInfo *info = &h264parse->picture_info;
+  gboolean is_idr;
+  gboolean is_ref;
+  gint32 frame_num_offset;
+
+  g_return_if_fail (slice != NULL);
+  g_return_if_fail (slice->pps != NULL);
+  g_return_if_fail (slice->pps->sequence != NULL);
+
+  if (info->valid && slice->first_mb_in_slice != 0)
+    return;
+
+  sps = slice->pps->sequence;
+  is_idr = nalu->idr_pic_flag != 0;
+  is_ref = nalu->ref_idc != 0;
+
+  memset (info, 0, sizeof (*info));
+  info->valid = TRUE;
+  info->is_idr = is_idr;
+  info->is_keyframe = is_idr || GST_H264_IS_I_SLICE (slice) ||
+      GST_H264_IS_SI_SLICE (slice);
+  info->slice_type = slice->type;
+  info->frame_num = slice->frame_num;
+  info->max_num_ref_frames = MIN (sps->num_ref_frames, G_MAXUINT8);
+  info->num_ref_idx_l0_active =
+      GST_H264_IS_I_SLICE (slice) ? 0 :
+      MIN ((guint) slice->num_ref_idx_l0_active_minus1 + 1, (guint) G_MAXUINT8);
+
+  if (GST_H264_IS_SVC_NALU (nalu)) {
+    info->has_svc_extension = TRUE;
+    info->temporal_id = nalu->extension.svc.temporal_id;
+    info->dependency_id = nalu->extension.svc.dependency_id;
+    info->quality_id = nalu->extension.svc.quality_id;
+    info->discardable_flag = nalu->extension.svc.discardable_flag;
+    info->output_flag = nalu->extension.svc.output_flag;
+    info->use_ref_base_pic_flag = nalu->extension.svc.use_ref_base_pic_flag;
+    if (nalu->extension.svc.discardable_flag)
+      is_ref = FALSE;
+  } else if (h264parse->have_pending_svc_prefix) {
+    info->has_svc_extension = TRUE;
+    info->temporal_id = h264parse->pending_svc_prefix.temporal_id;
+    info->dependency_id = h264parse->pending_svc_prefix.dependency_id;
+    info->quality_id = h264parse->pending_svc_prefix.quality_id;
+    info->discardable_flag = h264parse->pending_svc_prefix.discardable_flag;
+    info->output_flag = h264parse->pending_svc_prefix.output_flag;
+    info->use_ref_base_pic_flag =
+        h264parse->pending_svc_prefix.use_ref_base_pic_flag;
+    if (h264parse->pending_svc_prefix.discardable_flag)
+      is_ref = FALSE;
+  } else if (GST_H264_IS_MVC_NALU (nalu)) {
+    info->temporal_id = nalu->extension.mvc.temporal_id;
+  }
+
+  info->ref_pic_flag = is_ref ? 1 : 0;
+  frame_num_offset = gst_h264_parse_compute_frame_num_offset (h264parse, sps,
+      slice->frame_num, is_idr);
+  info->display_poc =
+      gst_h264_parse_compute_display_poc (h264parse, nalu, slice,
+      frame_num_offset);
+  info->mmco5_reset = gst_h264_parse_slice_has_mmco5 (slice);
+  info->resets_dpb = is_idr || info->mmco5_reset;
+  info->has_used_ref_mask_l0 =
+      gst_h264_parser_identify_slice_ref_usage (&h264parse->nalparser,
+      (GstH264NalUnit *) nalu, (GstH264SliceHdr *) slice, &info->used_ref_mask_l0);
+
+  if (!info->has_svc_extension && GST_H264_IS_P_SLICE (slice)) {
+    if (!info->ref_pic_flag && (info->display_poc & 1)) {
+      info->temporal_id = 3;
+      h264parse->saw_nonref_poc_interleave = TRUE;
+    } else if (h264parse->saw_nonref_poc_interleave &&
+        info->ref_pic_flag && ((info->display_poc & 1) == 0)) {
+      if ((info->display_poc % 8) == 0)
+        info->temporal_id = 0;
+      else if ((info->display_poc % 4) == 0)
+        info->temporal_id = 1;
+      else
+        info->temporal_id = 2;
+    }
+  }
+
+  if (info->resets_dpb) {
+    h264parse->prev_frame_num = 0;
+    h264parse->prev_frame_num_offset = 0;
+    h264parse->have_prev_frame_num = FALSE;
+    h264parse->prev_poc_msb = 0;
+    h264parse->prev_poc_lsb = 0;
+    h264parse->have_prev_ref_pic_order = FALSE;
+    return;
+  }
+
+  h264parse->prev_frame_num = slice->frame_num;
+  h264parse->prev_frame_num_offset = frame_num_offset;
+  h264parse->have_prev_frame_num = TRUE;
+
+  if (sps->pic_order_cnt_type == 0 && info->ref_pic_flag) {
+    gint32 max_poc_lsb = 1 << (sps->log2_max_pic_order_cnt_lsb_minus4 + 4);
+    gint32 poc_msb = info->display_poc - slice->pic_order_cnt_lsb;
+
+    if (max_poc_lsb > 0)
+      poc_msb = info->display_poc - slice->pic_order_cnt_lsb;
+
+    h264parse->prev_poc_msb = poc_msb;
+    h264parse->prev_poc_lsb = slice->pic_order_cnt_lsb;
+    h264parse->have_prev_ref_pic_order = TRUE;
+  }
+}
+
+static void
+gst_h264_parse_add_temporal_meta (GstH264Parse * h264parse, GstBuffer * buffer)
+{
+  GstCustomMeta *meta;
+  GstStructure *s;
+
+  if (!h264parse->picture_info.valid || buffer == NULL)
+    return;
+
+  gst_h264_parse_ensure_temporal_meta_registered ();
+  gst_buffer_foreach_meta (buffer, gst_h264_parse_drop_temporal_meta, NULL);
+
+  meta = gst_buffer_add_custom_meta (buffer, GST_H264_TEMPORAL_META_NAME);
+  if (meta == NULL)
+    return;
+
+  s = gst_custom_meta_get_structure (meta);
+  gst_structure_set (s,
+      "is-idr", G_TYPE_BOOLEAN, h264parse->picture_info.is_idr,
+      "is-keyframe", G_TYPE_BOOLEAN, h264parse->picture_info.is_keyframe,
+      "has-svc-extension", G_TYPE_BOOLEAN,
+      h264parse->picture_info.has_svc_extension,
+      "picture-type", G_TYPE_STRING,
+      gst_h264_parse_picture_type_name (&h264parse->picture_info),
+      "slice-type", G_TYPE_UINT, (guint) h264parse->picture_info.slice_type,
+      "frame-num", G_TYPE_UINT, (guint) h264parse->picture_info.frame_num,
+      "display-poc", G_TYPE_INT, h264parse->picture_info.display_poc,
+      "ref-pic-flag", G_TYPE_UINT, (guint) h264parse->picture_info.ref_pic_flag,
+      "max-num-ref-frames", G_TYPE_UINT,
+      (guint) h264parse->picture_info.max_num_ref_frames,
+      "num-ref-idx-l0-active", G_TYPE_UINT,
+      (guint) h264parse->picture_info.num_ref_idx_l0_active,
+      "has-used-ref-mask-l0", G_TYPE_BOOLEAN,
+      h264parse->picture_info.has_used_ref_mask_l0,
+      "used-ref-mask-l0", G_TYPE_UINT, h264parse->picture_info.used_ref_mask_l0,
+      "temporal-id", G_TYPE_UINT, (guint) h264parse->picture_info.temporal_id,
+      "dependency-id", G_TYPE_UINT,
+      (guint) h264parse->picture_info.dependency_id,
+      "quality-id", G_TYPE_UINT, (guint) h264parse->picture_info.quality_id,
+      "discardable-flag", G_TYPE_UINT,
+      (guint) h264parse->picture_info.discardable_flag,
+      "output-flag", G_TYPE_UINT, (guint) h264parse->picture_info.output_flag,
+      "use-ref-base-pic-flag", G_TYPE_UINT,
+      (guint) h264parse->picture_info.use_ref_base_pic_flag,
+      "mmco5-reset", G_TYPE_BOOLEAN, h264parse->picture_info.mmco5_reset,
+      "resets-dpb", G_TYPE_BOOLEAN, h264parse->picture_info.resets_dpb,
+      NULL);
 }
 
 static void
@@ -328,6 +674,7 @@ gst_h264_parse_start (GstBaseParse * parse)
   gst_h264_parse_reset (h264parse);
 
   h264parse->nalparser = gst_h264_nal_parser_new ();
+  h264parse->nalparser->temporal_sps_fixup = h264parse->temporal_sps_fixup;
 
   h264parse->state = 0;
   h264parse->dts = GST_CLOCK_TIME_NONE;
@@ -483,6 +830,373 @@ gst_h264_parse_negotiate (GstH264Parse * h264parse, gint in_format,
     gst_caps_unref (caps);
 }
 
+typedef struct
+{
+  const guint8 *data;
+  guint size_bits;
+  guint bit_pos;
+} GstH264ParseBitReader;
+
+static gboolean
+gst_h264_parse_br_get_bit (GstH264ParseBitReader * br, guint8 * value)
+{
+  guint byte_idx;
+
+  g_return_val_if_fail (br != NULL, FALSE);
+  g_return_val_if_fail (value != NULL, FALSE);
+
+  if (br->bit_pos >= br->size_bits)
+    return FALSE;
+
+  byte_idx = br->bit_pos >> 3;
+  *value = (br->data[byte_idx] >> (7 - (br->bit_pos & 7))) & 1;
+  br->bit_pos++;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parse_br_get_bits (GstH264ParseBitReader * br, guint nbits,
+    guint32 * value)
+{
+  guint32 out = 0;
+  guint i;
+  guint8 bit = 0;
+
+  g_return_val_if_fail (value != NULL, FALSE);
+
+  for (i = 0; i < nbits; i++) {
+    if (!gst_h264_parse_br_get_bit (br, &bit))
+      return FALSE;
+    out = (out << 1) | bit;
+  }
+
+  *value = out;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parse_br_get_ue (GstH264ParseBitReader * br, guint32 * value)
+{
+  guint zeros = 0;
+  guint8 bit = 0;
+  guint32 suffix = 0;
+
+  g_return_val_if_fail (value != NULL, FALSE);
+
+  do {
+    if (!gst_h264_parse_br_get_bit (br, &bit))
+      return FALSE;
+    if (bit == 0)
+      zeros++;
+  } while (bit == 0);
+
+  if (zeros > 31)
+    return FALSE;
+
+  if (zeros > 0 && !gst_h264_parse_br_get_bits (br, zeros, &suffix))
+    return FALSE;
+
+  *value = ((1u << zeros) - 1u) + suffix;
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parse_br_get_se (GstH264ParseBitReader * br, gint32 * value)
+{
+  guint32 code_num;
+
+  g_return_val_if_fail (value != NULL, FALSE);
+
+  if (!gst_h264_parse_br_get_ue (br, &code_num))
+    return FALSE;
+
+  if ((code_num & 1u) == 0)
+    *value = -(gint32) (code_num / 2u);
+  else
+    *value = (gint32) ((code_num + 1u) / 2u);
+
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parse_br_skip_scaling_list (GstH264ParseBitReader * br, guint size)
+{
+  guint j;
+  guint8 last_scale = 8;
+  guint8 next_scale = 8;
+
+  for (j = 0; j < size; j++) {
+    if (next_scale != 0) {
+      gint32 delta_scale;
+
+      if (!gst_h264_parse_br_get_se (br, &delta_scale))
+        return FALSE;
+      next_scale = (last_scale + delta_scale + 256) & 0xff;
+    }
+
+    if (next_scale != 0)
+      last_scale = next_scale;
+  }
+
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parse_locate_num_ref_frames_bits (const guint8 * rbsp,
+    guint rbsp_size, guint * field_start_bit, guint * field_end_bit,
+    guint32 * current_value)
+{
+  GstH264ParseBitReader br;
+  guint32 profile_idc;
+  guint32 chroma_format_idc = 1;
+  guint32 pic_order_cnt_type;
+  guint32 tmp;
+
+  g_return_val_if_fail (rbsp != NULL, FALSE);
+  g_return_val_if_fail (field_start_bit != NULL, FALSE);
+  g_return_val_if_fail (field_end_bit != NULL, FALSE);
+  g_return_val_if_fail (current_value != NULL, FALSE);
+
+  br.data = rbsp;
+  br.size_bits = rbsp_size * 8;
+  br.bit_pos = 0;
+
+  if (!gst_h264_parse_br_get_bits (&br, 8, &profile_idc) ||
+      !gst_h264_parse_br_get_bits (&br, 8, &tmp) ||
+      !gst_h264_parse_br_get_bits (&br, 8, &tmp) ||
+      !gst_h264_parse_br_get_ue (&br, &tmp))
+    return FALSE;
+
+  if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 ||
+      profile_idc == 244 || profile_idc == 44 || profile_idc == 83 ||
+      profile_idc == 86 || profile_idc == 118 || profile_idc == 128 ||
+      profile_idc == 138 || profile_idc == 139 || profile_idc == 134 ||
+      profile_idc == 135) {
+    guint i;
+    guint32 scaling_matrix_present_flag;
+
+    if (!gst_h264_parse_br_get_ue (&br, &chroma_format_idc))
+      return FALSE;
+    if (chroma_format_idc == 3) {
+      if (!gst_h264_parse_br_get_bits (&br, 1, &tmp))
+        return FALSE;
+    }
+    if (!gst_h264_parse_br_get_ue (&br, &tmp) ||
+        !gst_h264_parse_br_get_ue (&br, &tmp) ||
+        !gst_h264_parse_br_get_bits (&br, 1, &tmp))
+      return FALSE;
+
+    if (!gst_h264_parse_br_get_bits (&br, 1, &scaling_matrix_present_flag))
+      return FALSE;
+    if (scaling_matrix_present_flag) {
+      guint count = chroma_format_idc != 3 ? 8 : 12;
+      for (i = 0; i < count; i++) {
+        guint32 scaling_list_present_flag;
+
+        if (!gst_h264_parse_br_get_bits (&br, 1, &scaling_list_present_flag))
+          return FALSE;
+        if (scaling_list_present_flag) {
+          if (!gst_h264_parse_br_skip_scaling_list (&br, i < 6 ? 16 : 64))
+            return FALSE;
+        }
+      }
+    }
+  }
+
+  if (!gst_h264_parse_br_get_ue (&br, &tmp) ||
+      !gst_h264_parse_br_get_ue (&br, &pic_order_cnt_type))
+    return FALSE;
+
+  if (pic_order_cnt_type == 0) {
+    if (!gst_h264_parse_br_get_ue (&br, &tmp))
+      return FALSE;
+  } else if (pic_order_cnt_type == 1) {
+    guint32 num_ref_frames_in_cycle;
+    guint i;
+    gint32 offset_tmp;
+
+    if (!gst_h264_parse_br_get_bits (&br, 1, &tmp))
+      return FALSE;
+    if (!gst_h264_parse_br_get_se (&br, &offset_tmp) ||
+        !gst_h264_parse_br_get_se (&br, &offset_tmp) ||
+        !gst_h264_parse_br_get_ue (&br, &num_ref_frames_in_cycle))
+      return FALSE;
+    for (i = 0; i < num_ref_frames_in_cycle; i++) {
+      gint32 offset_for_ref_frame;
+
+      if (!gst_h264_parse_br_get_se (&br, &offset_for_ref_frame))
+        return FALSE;
+    }
+  }
+
+  *field_start_bit = br.bit_pos;
+  if (!gst_h264_parse_br_get_ue (&br, current_value))
+    return FALSE;
+  *field_end_bit = br.bit_pos;
+
+  return TRUE;
+}
+
+static gboolean
+gst_h264_parse_rewrite_temporal_sps_nal (const guint8 * nal_data, guint nal_size,
+    guint8 ** patched_data, guint * patched_size)
+{
+  const guint8 *payload;
+  guint payload_size;
+  guint8 *rbsp = NULL;
+  guint *rbsp_to_payload = NULL;
+  guint rbsp_size = 0;
+  guint payload_idx;
+  guint zero_count = 0;
+  guint start_bit = 0, end_bit = 0;
+  guint32 current_value = 0;
+  guint8 *out = NULL;
+  static const guint8 ue_5_bits[5] = { 0, 0, 1, 1, 0 };
+  guint i;
+
+  g_return_val_if_fail (patched_data != NULL, FALSE);
+  g_return_val_if_fail (patched_size != NULL, FALSE);
+
+  *patched_data = NULL;
+  *patched_size = 0;
+
+  if (nal_data == NULL || nal_size < 2)
+    return FALSE;
+
+  payload = nal_data + 1;
+  payload_size = nal_size - 1;
+  rbsp = g_new (guint8, payload_size);
+  rbsp_to_payload = g_new (guint, payload_size);
+
+  for (payload_idx = 0; payload_idx < payload_size; payload_idx++) {
+    guint8 byte = payload[payload_idx];
+
+    if (zero_count >= 2 && byte == 0x03) {
+      zero_count = 0;
+      continue;
+    }
+
+    rbsp[rbsp_size] = byte;
+    rbsp_to_payload[rbsp_size] = payload_idx + 1;
+    rbsp_size++;
+
+    if (byte == 0x00)
+      zero_count++;
+    else
+      zero_count = 0;
+  }
+
+  if (!gst_h264_parse_locate_num_ref_frames_bits (rbsp, rbsp_size, &start_bit,
+          &end_bit, &current_value))
+    goto done;
+
+  if (current_value != 3 || end_bit <= start_bit || (end_bit - start_bit) != 5)
+    goto done;
+
+  out = g_memdup2 (nal_data, nal_size);
+  for (i = 0; i < 5; i++) {
+    guint bit_idx = start_bit + i;
+    guint rbsp_byte_idx = bit_idx >> 3;
+    guint payload_byte_idx = rbsp_to_payload[rbsp_byte_idx];
+    guint8 mask = 1u << (7 - (bit_idx & 7));
+
+    if (ue_5_bits[i] != 0)
+      out[payload_byte_idx] |= mask;
+    else
+      out[payload_byte_idx] &= ~mask;
+  }
+
+  *patched_data = out;
+  *patched_size = nal_size;
+  out = NULL;
+
+done:
+  g_free (out);
+  g_free (rbsp);
+  g_free (rbsp_to_payload);
+  return *patched_data != NULL;
+}
+
+static gint
+gst_h264_parse_find_start_code (const guint8 * data, gsize size, gsize offset,
+    guint * prefix_size)
+{
+  gsize i;
+
+  for (i = offset; i + 3 < size; i++) {
+    if (data[i] == 0x00 && data[i + 1] == 0x00) {
+      if (data[i + 2] == 0x01) {
+        if (prefix_size != NULL)
+          *prefix_size = 3;
+        return (gint) i;
+      }
+      if (i + 3 < size && data[i + 2] == 0x00 && data[i + 3] == 0x01) {
+        if (prefix_size != NULL)
+          *prefix_size = 4;
+        return (gint) i;
+      }
+    }
+  }
+
+  return -1;
+}
+
+static void
+gst_h264_parse_rewrite_temporal_sps_in_buffer (GstH264Parse * h264parse,
+    GstBuffer * buffer)
+{
+  GstMapInfo map;
+  gint start = -1;
+  guint prefix_size = 0;
+
+  if (!h264parse->temporal_sps_fixup || h264parse->format != GST_H264_PARSE_FORMAT_BYTE ||
+      buffer == NULL)
+    return;
+
+  if (!gst_buffer_map (buffer, &map, GST_MAP_READWRITE))
+    return;
+
+  start = gst_h264_parse_find_start_code (map.data, map.size, 0, &prefix_size);
+  while (start >= 0) {
+    gint next_start;
+    guint next_prefix_size = 0;
+    gsize nal_start = start + prefix_size;
+    gsize nal_size;
+    guint8 nal_type;
+    guint8 *patched_data = NULL;
+    guint patched_size = 0;
+
+    if (nal_start >= map.size)
+      break;
+
+    next_start =
+        gst_h264_parse_find_start_code (map.data, map.size, nal_start, &next_prefix_size);
+    nal_size = (next_start >= 0 ? (gsize) next_start : map.size) - nal_start;
+    nal_type = map.data[nal_start] & 0x1f;
+
+    if ((nal_type == GST_H264_NAL_SPS || nal_type == GST_H264_NAL_SUBSET_SPS) &&
+        gst_h264_parse_rewrite_temporal_sps_nal (map.data + nal_start, nal_size,
+            &patched_data, &patched_size)) {
+      if (patched_size == nal_size) {
+        memcpy (map.data + nal_start, patched_data, nal_size);
+      } else {
+        GST_WARNING_OBJECT (h264parse,
+            "Skipping temporal SPS in-buffer rewrite due to size change (%u -> %u)",
+            (guint) nal_size, patched_size);
+      }
+      g_free (patched_data);
+    }
+
+    if (next_start < 0)
+      break;
+
+    start = next_start;
+    prefix_size = next_prefix_size;
+  }
+
+  gst_buffer_unmap (buffer, &map);
+}
+
 static GstBuffer *
 gst_h264_parse_wrap_nal (GstH264Parse * h264parse, guint format, guint8 * data,
     guint size)
@@ -518,6 +1232,8 @@ gst_h264_parser_store_nal (GstH264Parse * h264parse, guint id,
 {
   GstBuffer *buf, **store;
   guint size = nalu->size, store_size;
+  guint8 *patched_data = NULL;
+  guint patched_size = 0;
 
   if (naltype == GST_H264_NAL_SPS || naltype == GST_H264_NAL_SUBSET_SPS) {
     store_size = GST_H264_MAX_SPS_COUNT;
@@ -535,8 +1251,18 @@ gst_h264_parser_store_nal (GstH264Parse * h264parse, guint id,
     return;
   }
 
-  buf = gst_buffer_new_allocate (NULL, size, NULL);
-  gst_buffer_fill (buf, 0, nalu->data + nalu->offset, size);
+  if (h264parse->temporal_sps_fixup &&
+      (naltype == GST_H264_NAL_SPS || naltype == GST_H264_NAL_SUBSET_SPS) &&
+      gst_h264_parse_rewrite_temporal_sps_nal (nalu->data + nalu->offset, size,
+          &patched_data, &patched_size)) {
+    buf = gst_buffer_new_allocate (NULL, patched_size, NULL);
+    gst_buffer_fill (buf, 0, patched_data, patched_size);
+    size = patched_size;
+    g_free (patched_data);
+  } else {
+    buf = gst_buffer_new_allocate (NULL, size, NULL);
+    gst_buffer_fill (buf, 0, nalu->data + nalu->offset, size);
+  }
 
   /* Indicate that buffer contain a header needed for decoding */
   if (naltype == GST_H264_NAL_SPS || naltype == GST_H264_NAL_PPS)
@@ -1087,6 +1813,18 @@ gst_h264_parse_process_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
             h264parse->sei_pos);
       }
       break;
+    case GST_H264_NAL_PREFIX_UNIT:
+      if (!GST_H264_PARSE_STATE_VALID (h264parse, GST_H264_PARSE_STATE_GOT_SPS))
+        return FALSE;
+
+      pres = gst_h264_parser_parse_nal (nalparser, nalu);
+      if (pres != GST_H264_PARSER_OK)
+        return FALSE;
+      if (GST_H264_IS_SVC_NALU (nalu)) {
+        h264parse->pending_svc_prefix = nalu->extension.svc;
+        h264parse->have_pending_svc_prefix = TRUE;
+      }
+      break;
 
     case GST_H264_NAL_SLICE:
     case GST_H264_NAL_SLICE_DPA:
@@ -1112,15 +1850,14 @@ gst_h264_parse_process_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
         h264parse->frame_start = TRUE;
       }
       GST_DEBUG_OBJECT (h264parse, "frame start: %i", h264parse->frame_start);
-      if (nal_type == GST_H264_NAL_SLICE_EXT && !GST_H264_IS_MVC_NALU (nalu))
-        break;
-
       pres = gst_h264_parser_parse_slice_hdr (nalparser, nalu, &slice,
-          FALSE, FALSE);
+          FALSE, TRUE);
       GST_DEBUG_OBJECT (h264parse,
           "parse result %d, first MB: %u, slice type: %u",
           pres, slice.first_mb_in_slice, slice.type);
       if (pres == GST_H264_PARSER_OK) {
+        gst_h264_parse_capture_picture_info (h264parse, nalu, &slice);
+        h264parse->have_pending_svc_prefix = FALSE;
         if (GST_H264_IS_I_SLICE (&slice) || GST_H264_IS_SI_SLICE (&slice))
           h264parse->keyframe = TRUE;
         else if (GST_H264_IS_P_SLICE (&slice)
@@ -1230,7 +1967,8 @@ gst_h264_parse_collect_nal (GstH264Parse * h264parse, GstH264NalUnit * nalu)
   if (nalu->size > nalu->header_bytes)
     complete |= h264parse->picture_start && (nal_type == GST_H264_NAL_SLICE
         || nal_type == GST_H264_NAL_SLICE_DPA
-        || nal_type == GST_H264_NAL_SLICE_IDR) &&
+        || nal_type == GST_H264_NAL_SLICE_IDR
+        || nal_type == GST_H264_NAL_SLICE_EXT) &&
         (nalu->data[nalu->offset + nalu->header_bytes] & 0x80);
 
   GST_LOG_OBJECT (h264parse, "au complete: %d", complete);
@@ -3473,6 +4211,8 @@ gst_h264_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
     parse_buffer = frame->buffer = gst_buffer_make_writable (frame->buffer);
   }
 
+  gst_h264_parse_rewrite_temporal_sps_in_buffer (h264parse, parse_buffer);
+
   sps = h264parse->nalparser->last_sps;
   if (sps && sps->vui_parameters_present_flag &&
       sps->vui_parameters.timing_info_present_flag &&
@@ -3624,6 +4364,8 @@ gst_h264_parse_pre_push_frame (GstBaseParse * parse, GstBaseParseFrame * frame)
     if (h264parse->sei_pic_struct == GST_H264_SEI_PIC_STRUCT_TOP_FIELD)
       GST_BUFFER_FLAG_SET (parse_buffer, GST_VIDEO_BUFFER_FLAG_TFF);
   }
+
+  gst_h264_parse_add_temporal_meta (h264parse, parse_buffer);
 
   gst_video_push_user_data ((GstElement *) h264parse, &h264parse->user_data,
       parse_buffer);
@@ -4037,6 +4779,11 @@ gst_h264_parse_set_property (GObject * object, guint prop_id,
     case PROP_UPDATE_TIMECODE:
       parse->update_timecode = g_value_get_boolean (value);
       break;
+    case PROP_TEMPORAL_SPS_FIXUP:
+      parse->temporal_sps_fixup = g_value_get_boolean (value);
+      if (parse->nalparser != NULL)
+        parse->nalparser->temporal_sps_fixup = parse->temporal_sps_fixup;
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -4057,6 +4804,9 @@ gst_h264_parse_get_property (GObject * object, guint prop_id,
       break;
     case PROP_UPDATE_TIMECODE:
       g_value_set_boolean (value, parse->update_timecode);
+      break;
+    case PROP_TEMPORAL_SPS_FIXUP:
+      g_value_set_boolean (value, parse->temporal_sps_fixup);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);

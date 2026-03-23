@@ -393,6 +393,7 @@ transport_stream_init (TransportStream * stream)
 
   stream->rtphdrext_id_stream_id = -1;
   stream->rtphdrext_id_repaired_stream_id = -1;
+  stream->rtpbin_sendbin_deferred_session_id = -1;
 }
 
 TransportStream *
