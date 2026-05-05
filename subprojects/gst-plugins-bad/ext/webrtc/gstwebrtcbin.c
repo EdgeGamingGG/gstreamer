@@ -5245,14 +5245,17 @@ _set_internal_rtpbin_element_props_from_stream (GstWebRTCBin * webrtc,
         g_object_set (trans->redenc, "pt", red_pt, "allow-no-red-blocks",
             always_produce, NULL);
 
-        /* Find the primary RTX PT for this mline so redenc passes RTX
-         * packets through unchanged (no RED wrapping). The RTX PT for
-         * the primary media codec is the one with apt matching the
-         * media codec PT. */
+        /* In a bundled transport this RED encoder sits after the shared
+         * rtpbin output, so it can see packets for other m-lines too. Audio
+         * must remain plain Opus; otherwise Chrome sees the audio SSRC with
+         * the video RED payload type and never creates inbound audio RTP
+         * stats. Prefer preserving audio over raw RTX when both are present. */
         {
           guint j;
           gint media_codec_pt = -1;
           gint rtx_pt_for_media = -1;
+          gint audio_pt = -1;
+          gint exclude_pt = -1;
 
           /* First find the primary media PT */
           for (j = 0; j < stream->ptmap->len; j++) {
@@ -5264,6 +5267,18 @@ _set_internal_rtpbin_element_props_from_stream (GstWebRTCBin * webrtc,
                   && g_strcmp0 (enc, "ULPFEC") != 0
                   && g_strcmp0 (enc, "RTX") != 0) {
                 media_codec_pt = pitem->pt;
+                break;
+              }
+            }
+          }
+
+          for (j = 0; j < stream->ptmap->len; j++) {
+            PtMapItem *pitem = &g_array_index (stream->ptmap, PtMapItem, j);
+            if (pitem->media_idx != rtp_trans->mline && pitem->caps) {
+              GstStructure *ps = gst_caps_get_structure (pitem->caps, 0);
+              const gchar *enc = gst_structure_get_string (ps, "encoding-name");
+              if (enc && g_strcmp0 (enc, "OPUS") == 0) {
+                audio_pt = pitem->pt;
                 break;
               }
             }
@@ -5288,8 +5303,9 @@ _set_internal_rtpbin_element_props_from_stream (GstWebRTCBin * webrtc,
             }
           }
 
-          if (rtx_pt_for_media >= 0)
-            g_object_set (trans->redenc, "exclude-pt", rtx_pt_for_media, NULL);
+          exclude_pt = audio_pt >= 0 ? audio_pt : rtx_pt_for_media;
+          if (exclude_pt >= 0)
+            g_object_set (trans->redenc, "exclude-pt", exclude_pt, NULL);
         }
       }
 
@@ -5368,16 +5384,21 @@ _connect_input_stream (GstWebRTCBin * webrtc, GstWebRTCBinPad * pad)
 
   srcpad = gst_element_get_static_pad (clocksync, "src");
 
-  fec_encoder = _build_fec_encoder (webrtc, trans);
-  if (!fec_encoder) {
-    g_warn_if_reached ();
-    return NULL;
+  fec_encoder = NULL;
+  if (trans->fec_type != GST_WEBRTC_FEC_TYPE_NONE) {
+    fec_encoder = _build_fec_encoder (webrtc, trans);
+    if (!fec_encoder) {
+      g_warn_if_reached ();
+      return NULL;
+    }
   }
 
   _set_internal_rtpbin_element_props_from_stream (webrtc, trans->stream);
 
-  gst_bin_add (GST_BIN (webrtc), fec_encoder);
-  gst_element_sync_state_with_parent (fec_encoder);
+  if (fec_encoder) {
+    gst_bin_add (GST_BIN (webrtc), fec_encoder);
+    gst_element_sync_state_with_parent (fec_encoder);
+  }
 
   sinkpad = gst_element_get_static_pad (clocksync, "sink");
 
