@@ -495,6 +495,46 @@ rtp_twcc_stats_get_packets_structure (GArray * twcc_packets)
   return ret;
 }
 
+#define RTP_TWCC_PACKED_PACKET_SIZE 24
+
+/* RTPTWCCPacketsPacked is used on the receive queue thread.  Keep this format
+ * flat and cheap: the older per-packet GstStructure array made TWCC feedback
+ * handling allocation-heavy enough to saturate queue*:src and grow receive
+ * queue latency into seconds under normal browser feedback rates. */
+GstStructure *
+rtp_twcc_stats_get_packets_packed_structure (GArray * twcc_packets)
+{
+  GstStructure *ret;
+  GBytes *bytes;
+  guint8 *data;
+  guint i;
+  guint n_packets;
+
+  n_packets = twcc_packets ? twcc_packets->len : 0;
+  data = g_malloc (n_packets * RTP_TWCC_PACKED_PACKET_SIZE);
+
+  for (i = 0; i < n_packets; i++) {
+    RTPTWCCPacket *pkt = &g_array_index (twcc_packets, RTPTWCCPacket, i);
+    guint8 *out = data + (i * RTP_TWCC_PACKED_PACKET_SIZE);
+
+    GST_WRITE_UINT16_BE (out, pkt->seqnum);
+    GST_WRITE_UINT64_BE (out + 2, pkt->local_ts);
+    GST_WRITE_UINT64_BE (out + 10, pkt->remote_ts);
+    GST_WRITE_UINT32_BE (out + 18, pkt->size);
+    out[22] = (guint8) pkt->status;
+    out[23] = pkt->pt;
+  }
+
+  bytes = g_bytes_new_take (data, n_packets * RTP_TWCC_PACKED_PACKET_SIZE);
+  ret = gst_structure_new ("RTPTWCCPacketsPacked",
+      "version", G_TYPE_UINT, 1,
+      "packet-size", G_TYPE_UINT, RTP_TWCC_PACKED_PACKET_SIZE,
+      "packets", G_TYPE_BYTES, bytes, NULL);
+  g_bytes_unref (bytes);
+
+  return ret;
+}
+
 static void
 rtp_twcc_stats_calculate_stats (RTPTWCCStats * stats, GArray * twcc_packets)
 {

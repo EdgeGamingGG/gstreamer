@@ -2991,7 +2991,7 @@ rtp_session_process_twcc (RTPSession * sess, guint32 sender_ssrc,
   if (twcc_packets == NULL)
     return;
 
-  twcc_packets_s = rtp_twcc_stats_get_packets_structure (twcc_packets);
+  twcc_packets_s = rtp_twcc_stats_get_packets_packed_structure (twcc_packets);
   twcc_stats_s =
       rtp_twcc_stats_process_packets (sess->twcc_stats, twcc_packets);
 
