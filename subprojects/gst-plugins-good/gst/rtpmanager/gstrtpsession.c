@@ -3022,22 +3022,26 @@ gst_rtp_session_notify_twcc (RTPSession * sess,
   GST_RTP_SESSION_UNLOCK (rtpsession);
 
   if (send_rtp_sink) {
-    event =
-        gst_event_new_custom (GST_EVENT_CUSTOM_UPSTREAM,
-        gst_structure_copy (twcc_packets));
+    /* The upstream RTPTWCCPackets event is consumed by rtpgccbwe.  This
+     * function owns twcc_packets, so move it directly into the event instead of
+     * deep-copying the per-packet GstStructure array on the receive queue
+     * thread.  The old copy/free path can dominate CPU at high RTP packet
+     * rates and cause the ICE receive queue to build seconds of latency. */
+    event = gst_event_new_custom (GST_EVENT_CUSTOM_UPSTREAM, twcc_packets);
+    twcc_packets = NULL;
     gst_pad_push_event (send_rtp_sink, event);
     gst_object_unref (send_rtp_sink);
   }
 
   if (send_rtp_src) {
-    event =
-        gst_event_new_custom (GST_EVENT_CUSTOM_DOWNSTREAM,
-        gst_structure_copy (twcc_packets));
-    gst_pad_push_event (send_rtp_src, event);
+    /* rtpgccbwe handles the upstream event on the send path.  There is no
+     * downstream consumer for RTPTWCCPackets in webrtcbin, and forwarding a
+     * second copy through the SRTP/DTLS side only adds avoidable work. */
     gst_object_unref (send_rtp_src);
   }
 
-  gst_structure_free (twcc_packets);
+  if (twcc_packets)
+    gst_structure_free (twcc_packets);
   g_object_notify (G_OBJECT (rtpsession), "twcc-stats");
 }
 
