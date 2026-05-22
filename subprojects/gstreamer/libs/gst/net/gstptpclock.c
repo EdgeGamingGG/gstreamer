@@ -567,7 +567,7 @@ parse_ptp_message_announce (PtpMessage * msg, GstByteReader * reader)
 {
   g_return_val_if_fail (msg->message_type == PTP_MESSAGE_TYPE_ANNOUNCE, FALSE);
 
-  if (gst_byte_reader_get_remaining (reader) < 20)
+  if (gst_byte_reader_get_remaining (reader) < 30)
     return FALSE;
 
   if (!parse_ptp_timestamp (&msg->message_specific.announce.origin_timestamp,
@@ -2095,6 +2095,8 @@ have_stdout_body (GInputStream * stdout_pipe, GAsyncResult * res,
       guint8 iface_idx;
       GstClockTime helper_receive_time;
       PtpMessage msg;
+
+      memset (&msg, 0, sizeof (msg));
 
       iface_idx = GST_READ_UINT8 (stdout_buffer);
       helper_receive_time = GST_READ_UINT64_BE (stdout_buffer + 1);

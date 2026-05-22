@@ -52,6 +52,11 @@
 #include <sys/types.h>
 #include <fcntl.h>
 
+#include <sys/stat.h>
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
+
 #ifdef G_OS_WIN32
 #include <io.h>                 /* lseek, open, close, read */
 #undef lseek
@@ -65,11 +70,6 @@
 #ifdef _MSC_VER                 /* Check if we are using MSVC, fileno is deprecated in favour */
 #define fileno _fileno          /* of _fileno */
 #endif
-#endif
-
-#include <sys/stat.h>
-#ifdef HAVE_UNISTD_H
-#include <unistd.h>
 #endif
 
 #include "gstelements_private.h"
@@ -161,17 +161,18 @@ gst_fopen (const gchar * filename, const gchar * mode, gboolean o_sync)
   return retval;
 #else
   int fd;
-  int flags = O_CREAT | O_WRONLY;
+  int flags;
 
   /* NOTE: below code is for handing spurious EACCES return on write
    * See https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/143
    */
   if (strcmp (mode, "wb") == 0)
-    flags |= O_TRUNC;
+    flags = O_WRONLY | O_CREAT | O_TRUNC;
   else if (strcmp (mode, "ab") == 0)
-    flags |= O_APPEND;
+    flags = O_WRONLY | O_CREAT | O_APPEND;
   else if (strcmp (mode, "rb+") == 0)
-    flags |= O_RDWR;
+    /* Special mode: will replace file without truncation (in-place) */
+    flags = O_RDWR | O_CREAT;
   else
     g_assert_not_reached ();
 

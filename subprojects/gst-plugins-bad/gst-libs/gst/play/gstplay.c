@@ -197,6 +197,8 @@ struct _GstPlay
   GstClockTime seek_position;
 
   GstStreamCollection *collection;
+  guint32 selection_seqnum;
+  GList *current_selection;
   gchar *video_sid;
   gboolean video_enabled;
   gchar *audio_sid;
@@ -310,6 +312,7 @@ gst_play_init (GstPlay * self)
   self->audio_enabled = TRUE;
   self->video_enabled = TRUE;
   self->subtitle_enabled = TRUE;
+  self->selection_seqnum = GST_SEQNUM_INVALID;
 
   GST_TRACE_OBJECT (self, "Initialized");
 }
@@ -513,6 +516,7 @@ gst_play_finalize (GObject * object)
     gst_structure_free (self->config);
   if (self->collection)
     gst_object_unref (self->collection);
+  g_list_free_full (self->current_selection, g_free);
   if (self->media_info)
     g_object_unref (self->media_info);
   g_mutex_clear (&self->lock);
@@ -1869,22 +1873,13 @@ streams_selected_cb (G_GNUC_UNUSED GstBus * bus, GstMessage * msg,
     gpointer user_data)
 {
   GstPlay *self = GST_PLAY (user_data);
-  GstStreamCollection *collection = NULL;
-
-  gst_message_parse_streams_selected (msg, &collection);
-
-  if (!collection)
-    return;
+  guint32 seqnum = gst_message_get_seqnum (msg);
 
   g_mutex_lock (&self->lock);
-  gboolean updated = update_stream_collection (self, collection);
-  gst_object_unref (collection);
-
-  // This should not really happen: we should first get a stream-collection
-  // message with the new collection, then selection happens.
-  if (updated) {
-    GST_WARNING_OBJECT (self,
-        "Updated stream collection from streams-selected message");
+  // Ignore selections for previous select-streams events
+  if (self->selection_seqnum != seqnum) {
+    g_mutex_unlock (&self->lock);
+    return;
   }
 
   gboolean found_audio = self->audio_sid == NULL;
@@ -1921,9 +1916,10 @@ streams_selected_cb (G_GNUC_UNUSED GstBus * bus, GstMessage * msg,
       }
     }
 
-    if ((stream_type & GST_STREAM_TYPE_TEXT) && self->subtitle_enabled) {
+    if ((stream_type & GST_STREAM_TYPE_TEXT)) {
       GST_DEBUG_OBJECT (self, "Selected subtitle track %s", stream_id);
-      if (g_strcmp0 (self->subtitle_sid, stream_id) == 0) {
+      if (g_strcmp0 (self->subtitle_sid, stream_id) == 0
+          && self->subtitle_enabled) {
         found_subtitle = TRUE;
       } else {
         GST_WARNING_OBJECT (self, "Unexpected subtitle stream id '%s' selected",
@@ -1947,9 +1943,6 @@ streams_selected_cb (G_GNUC_UNUSED GstBus * bus, GstMessage * msg,
         self->subtitle_sid);
   }
   g_mutex_unlock (&self->lock);
-
-  if (self->media_info && updated)
-    on_media_info_updated (self);
 }
 
 static void
@@ -2231,7 +2224,7 @@ gst_play_stream_info_find_from_stream_id (GstPlayMediaInfo * media_info,
   for (l = list; l != NULL; l = l->next) {
     info = (GstPlayStreamInfo *) l->data;
     if (g_str_equal (info->stream_id, stream_id)) {
-      return info;
+      return g_object_ref (info);
     }
   }
 
@@ -2251,24 +2244,25 @@ is_track_enabled (GstPlay * self, gint pos)
   return FALSE;
 }
 
+/* Must be called with lock */
 static GstPlayStreamInfo *
 gst_play_stream_info_get_current_from_stream_id (GstPlay * self,
     const gchar * stream_id, GType type)
 {
   GstPlayStreamInfo *info;
+  GstPlayStreamInfo *result_info = NULL;
 
   if (!self->media_info || !stream_id)
     return NULL;
 
-  g_mutex_lock (&self->lock);
   info = gst_play_stream_info_find_from_stream_id (self->media_info, stream_id);
-  if (info && G_OBJECT_TYPE (info) == type)
-    info = gst_play_stream_info_copy (info);
-  else
-    info = NULL;
-  g_mutex_unlock (&self->lock);
+  if (info) {
+    if (G_OBJECT_TYPE (info) == type)
+      result_info = gst_play_stream_info_copy (info);
+    g_object_unref (info);
+  }
 
-  return info;
+  return result_info;
 }
 
 static void
@@ -2291,6 +2285,7 @@ stream_notify_cb (GstStreamCollection * collection, GstStream * stream,
   info = gst_play_stream_info_find_from_stream_id (self->media_info, stream_id);
   if (info) {
     gst_play_stream_info_update_from_stream (self, info, stream);
+    g_object_unref (info);
     emit_signal = TRUE;
   }
   g_mutex_unlock (&self->lock);
@@ -2334,7 +2329,7 @@ stream_info_get_codec (GstPlayStreamInfo * s)
   if (!codec) {
     GstCaps *caps;
     caps = gst_play_stream_info_get_caps (s);
-    if (caps) {
+    if (caps && gst_caps_is_fixed (caps)) {
       codec = gst_pb_utils_get_codec_description (caps);
     }
   }
@@ -2961,6 +2956,9 @@ gst_play_stop_internal (GstPlay * self, gboolean transient)
     gst_object_unref (self->collection);
     self->collection = NULL;
   }
+  self->selection_seqnum = GST_SEQNUM_INVALID;
+  g_list_free_full (self->current_selection, g_free);
+  self->current_selection = NULL;
   g_free (self->video_sid);
   g_free (self->audio_sid);
   g_free (self->subtitle_sid);
@@ -3448,12 +3446,16 @@ gst_play_get_current_audio_track (GstPlay * self)
 
   g_return_val_if_fail (GST_IS_PLAY (self), NULL);
 
-  if (!is_track_enabled (self, GST_PLAY_FLAG_AUDIO))
+  g_mutex_lock (&self->lock);
+  if (!self->audio_enabled) {
+    g_mutex_unlock (&self->lock);
     return NULL;
+  }
 
   info = (GstPlayAudioInfo *)
       gst_play_stream_info_get_current_from_stream_id (self,
       self->audio_sid, GST_TYPE_PLAY_AUDIO_INFO);
+  g_mutex_unlock (&self->lock);
 
   return info;
 }
@@ -3476,12 +3478,16 @@ gst_play_get_current_video_track (GstPlay * self)
 
   g_return_val_if_fail (GST_IS_PLAY (self), NULL);
 
-  if (!is_track_enabled (self, GST_PLAY_FLAG_VIDEO))
+  g_mutex_lock (&self->lock);
+  if (!self->video_enabled) {
+    g_mutex_unlock (&self->lock);
     return NULL;
+  }
 
   info = (GstPlayVideoInfo *)
       gst_play_stream_info_get_current_from_stream_id (self,
       self->video_sid, GST_TYPE_PLAY_VIDEO_INFO);
+  g_mutex_unlock (&self->lock);
 
   return info;
 }
@@ -3504,14 +3510,35 @@ gst_play_get_current_subtitle_track (GstPlay * self)
 
   g_return_val_if_fail (GST_IS_PLAY (self), NULL);
 
-  if (!is_track_enabled (self, GST_PLAY_FLAG_SUBTITLE))
+  g_mutex_lock (&self->lock);
+  if (!self->subtitle_enabled) {
+    g_mutex_unlock (&self->lock);
     return NULL;
+  }
 
   info = (GstPlaySubtitleInfo *)
       gst_play_stream_info_get_current_from_stream_id (self,
       self->subtitle_sid, GST_TYPE_PLAY_SUBTITLE_INFO);
+  g_mutex_unlock (&self->lock);
 
   return info;
+}
+
+static gboolean
+is_same_stream_selection (GList * a, GList * b)
+{
+  // We always create the list in the same order so
+  // checking both lists linearly is sufficient
+  while (a && b) {
+    if (!g_str_equal (a->data, b->data))
+      return FALSE;
+
+    a = a->next;
+    b = b->next;
+  }
+
+  // If both lists are at the end now then they were equal
+  return a == b;
 }
 
 /* Must be called with lock */
@@ -3537,15 +3564,25 @@ gst_play_select_streams (GstPlay * self)
     stream_list = g_list_append (stream_list, g_strdup (self->subtitle_sid));
   }
 
-  g_mutex_unlock (&self->lock);
   if (stream_list) {
-    ret = gst_element_send_event (self->playbin,
-        gst_event_new_select_streams (stream_list));
-    g_list_free_full (stream_list, g_free);
+    if (is_same_stream_selection (self->current_selection, stream_list)) {
+      GST_DEBUG_OBJECT (self, "Stream selection did not change");
+      g_list_free_full (stream_list, g_free);
+    } else {
+      GstEvent *ev = gst_event_new_select_streams (stream_list);
+      g_list_free_full (self->current_selection, g_free);
+      self->current_selection = stream_list;
+      self->selection_seqnum = gst_event_get_seqnum (ev);
+      g_mutex_unlock (&self->lock);
+      ret = gst_element_send_event (self->playbin, ev);
+      g_mutex_lock (&self->lock);
+      if (!ret) {
+        GST_WARNING_OBJECT (self, "Stream selection failed");
+      }
+    }
   } else {
     GST_ERROR_OBJECT (self, "No available streams for select-streams");
   }
-  g_mutex_lock (&self->lock);
 
   return ret;
 }

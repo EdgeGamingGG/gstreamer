@@ -1460,7 +1460,8 @@ gst_h266_parser_parse_pic_timing (GstH266PicTiming * pt,
 
   if (bp->du_hrd_params_present_flag &&
       bp->du_cpb_params_in_pic_timing_sei_flag) {
-    READ_UE (nr, pt->num_decoding_units_minus1);
+    READ_UE_MAX (nr, pt->num_decoding_units_minus1,
+        GST_H266_MAX_DECODING_UNITS_IN_PIC_TIMING - 1);
     if (pt->num_decoding_units_minus1 > 0) {
       READ_UINT8 (nr, pt->du_common_cpb_removal_delay_flag, 1);
       if (pt->du_common_cpb_removal_delay_flag) {
@@ -3537,6 +3538,11 @@ gst_h266_parser_parse_picture_partition (GstH266SPS * sps,
             guint16 slice_height_in_ctus;
 
             for (j = 0; j < pps->num_exp_slices_in_tile[i]; j++) {
+              if (i + j >= pps->num_slices_in_pic_minus1) {
+                GST_WARNING ("Too may slices %d", i + j + 1);
+                goto error;
+              }
+
               READ_UE_MAX (nr, pps->exp_slice_height_in_ctus_minus1[i][j],
                   pps->tile_row_height_minus1[tile_y]);
 
@@ -3618,15 +3624,28 @@ gst_h266_parser_parse_picture_partition (GstH266SPS * sps,
               goto error;
             }
 
-            tile_idx += pps->tile_idx_delta_val[i];
+            gint new_tile_idx = (gint) tile_idx + pps->tile_idx_delta_val[i];
+            if (new_tile_idx < 0 ||
+                new_tile_idx >= (gint) pps->num_tiles_in_pic) {
+              GST_WARNING ("tile_idx %d out of bounds.", new_tile_idx);
+              goto error;
+            }
+            tile_idx = new_tile_idx;
           } else {
             pps->tile_idx_delta_val[i] = 0;
 
-            tile_idx += pps->slice_width_in_tiles_minus1[i] + 1;
-            if (tile_idx % pps->num_tile_columns == 0) {
-              tile_idx += pps->slice_height_in_tiles_minus1[i] *
+            gint new_tile_idx = (gint) tile_idx +
+                pps->slice_width_in_tiles_minus1[i] + 1;
+            if (new_tile_idx % pps->num_tile_columns == 0) {
+              new_tile_idx += pps->slice_height_in_tiles_minus1[i] *
                   pps->num_tile_columns;
             }
+            if (new_tile_idx < 0 ||
+                new_tile_idx >= (gint) pps->num_tiles_in_pic) {
+              GST_WARNING ("tile_idx %d out of bounds.", new_tile_idx);
+              goto error;
+            }
+            tile_idx = new_tile_idx;
           }
         }
       }
@@ -4375,7 +4394,7 @@ gst_h266_parse_aps (GstH266Parser * parser, GstH266NalUnit * nalu,
   READ_UINT8 (&nr, params_type, 3);
   aps->params_type = params_type;
   READ_UINT8 (&nr, aps->aps_id, 5);
-  CHECK_ALLOWED_MAX (aps->aps_id, GST_H266_MAX_APS_COUNT);
+  CHECK_ALLOWED_MAX (aps->aps_id, GST_H266_MAX_APS_COUNT - 1);
   READ_UINT8 (&nr, aps->chroma_present_flag, 1);
 
   switch (aps->params_type) {

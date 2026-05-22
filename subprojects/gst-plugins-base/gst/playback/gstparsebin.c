@@ -3501,8 +3501,8 @@ sort_end_pads (GstParsePad * da, GstParsePad * db)
   } else {
     GstStructure *sa, *sb;
 
-    sa = gst_caps_get_structure ((const GstCaps *) capsa, 0);
-    sb = gst_caps_get_structure ((const GstCaps *) capsb, 0);
+    sa = gst_caps_get_structure (capsa, 0);
+    sb = gst_caps_get_structure (capsb, 0);
 
     namea = gst_structure_get_name (sa);
     nameb = gst_structure_get_name (sb);
@@ -4072,11 +4072,12 @@ static void
 gst_parse_pad_update_caps (GstParsePad * parsepad, GstCaps * caps)
 {
   if (caps && parsepad->active_stream) {
-    GST_DEBUG_OBJECT (parsepad, "Storing caps %" GST_PTR_FORMAT
-        " on stream %" GST_PTR_FORMAT, caps, parsepad->active_stream);
-
-    if (gst_caps_is_fixed (caps))
+    if (gst_caps_is_fixed (caps)) {
+      GST_DEBUG_OBJECT (parsepad, "Storing caps %" GST_PTR_FORMAT
+          " on stream %" GST_PTR_FORMAT, caps, parsepad->active_stream);
       gst_stream_set_caps (parsepad->active_stream, caps);
+    }
+
     /* intuit a type */
     if (gst_stream_get_stream_type (parsepad->active_stream) ==
         GST_STREAM_TYPE_UNKNOWN) {

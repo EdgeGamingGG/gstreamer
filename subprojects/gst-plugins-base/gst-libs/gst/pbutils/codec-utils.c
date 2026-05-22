@@ -3541,14 +3541,26 @@ gst_codec_utils_caps_get_mime_codec (GstCaps * caps)
     } else {
       mime_codec = g_strdup ("mp4a.40");
     }
+  } else if (g_strcmp0 (media_type, "audio/x-ac3") == 0) {
+    mime_codec = g_strdup ("ac-3");
+  } else if (g_strcmp0 (media_type, "audio/x-eac3") == 0) {
+    mime_codec = g_strdup ("ec-3");
+  } else if (g_strcmp0 (media_type, "audio/x-ac4") == 0) {
+    mime_codec = g_strdup ("ac-4");
   } else if (g_strcmp0 (media_type, "audio/x-opus") == 0) {
     mime_codec = g_strdup ("opus");
+  } else if (g_strcmp0 (media_type, "audio/x-flac") == 0) {
+    mime_codec = g_strdup ("flac");
   } else if (g_strcmp0 (media_type, "audio/x-mulaw") == 0) {
     mime_codec = g_strdup ("ulaw");
   } else if (g_strcmp0 (media_type, "audio/x-adpcm") == 0) {
     if (g_strcmp0 (gst_structure_get_string (caps_st, "layout"), "g726") == 0) {
       mime_codec = g_strdup ("g726");
     }
+  } else if (g_strcmp0 (media_type, "application/ttml+xml") == 0) {
+    mime_codec = g_strdup ("stpp");
+  } else if (g_strcmp0 (media_type, "application/x-subtitle-vtt") == 0) {
+    mime_codec = g_strdup ("wvtt");
   }
 
 done:
@@ -3713,6 +3725,9 @@ gst_codec_utils_caps_from_mime_codec_single (const gchar * codec)
       /* ETSI TS 102 366 v1.4.1 - Digital Audio Compression (AC-3, Enhanced AC-3) Standard, Annex F */
       caps = gst_caps_new_empty_simple ("audio/x-eac3");
       break;
+    case GST_MAKE_FOURCC ('a', 'c', '-', '4'):
+      caps = gst_caps_new_empty_simple ("audio/x-ac4");
+      break;
     case GST_MAKE_FOURCC ('s', 't', 'p', 'p'):
       /* IMSC1-conformant TTM XML */
       caps = gst_caps_new_empty_simple ("application/ttml+xml");
@@ -3738,6 +3753,9 @@ gst_codec_utils_caps_from_mime_codec_single (const gchar * codec)
     case GST_MAKE_FOURCC ('o', 'p', 'u', 's'):
       /* Opus */
       caps = gst_caps_new_empty_simple ("audio/x-opus");
+      break;
+    case GST_MAKE_FOURCC ('f', 'l', 'a', 'c'):
+      caps = gst_caps_new_empty_simple ("audio/x-flac");
       break;
     case GST_MAKE_FOURCC ('u', 'l', 'a', 'w'):
       /* ulaw */

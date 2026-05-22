@@ -173,6 +173,30 @@ GST_START_TEST (test_rtp_buffer_validate_corrupt)
 
 GST_END_TEST;
 
+GST_START_TEST (test_rtp_buffer_csrc_overflow)
+{
+  GstBuffer *buf;
+  GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+  /* RTP packet with CSRC count of 15 but only 12 bytes total
+   * Version=2, Padding=0, Extension=0, CC=15 (0x8F), Marker=0, PT=0
+   * This should be rejected as the CSRC list would extend beyond packet */
+  guint8 invalid_packet[] = {
+    0x8F, 0x00, 0x00, 0x00,     /* V=2, CC=15, M=0, PT=0, seq=0 */
+    0x00, 0x00, 0x00, 0x00,     /* timestamp = 0 */
+    0x00, 0x00, 0x00, 0x00      /* ssrc = 0 */
+        /* CSRC list missing - only 12 bytes but needs 12 + 15*4 = 72 bytes */
+  };
+
+  buf = gst_buffer_new_and_alloc (sizeof (invalid_packet));
+  gst_buffer_fill (buf, 0, invalid_packet, sizeof (invalid_packet));
+
+  /* This should fail due to CSRC list extending beyond packet boundary */
+  fail_if (gst_rtp_buffer_map (buf, GST_MAP_READ, &rtp));
+  gst_buffer_unref (buf);
+}
+
+GST_END_TEST;
+
 GST_START_TEST (test_rtp_buffer_validate_padding)
 {
   GstBuffer *buf;
@@ -2339,6 +2363,71 @@ GST_START_TEST (test_rtp_buffer_remove_extension_data)
 
 GST_END_TEST;
 
+GST_START_TEST (test_sdes_parsing_out_of_bounds)
+{
+  /* Test case for RTCP SDES packet parsing with out-of-bounds access.
+   * This test creates malformed SDES packets that could cause a read
+   * beyond the buffer limits and verifies that the parsing function
+   * correctly identifies the error and returns FALSE. */
+  GstRTCPBuffer rtcp = GST_RTCP_BUFFER_INIT;
+  GstRTCPPacket packet;
+  GstMapInfo map;
+  GstBuffer *buffer;
+  guint8 *data;
+  gboolean ret;
+
+  /* Packet 1: Truncated packet where length field is missing */
+  buffer = gst_buffer_new_and_alloc (4);
+  gst_buffer_map (buffer, &map, GST_MAP_WRITE);
+  data = map.data;
+  /* V=2, P=0, RC=1, PT=202 (SDES), length=0 */
+  GST_WRITE_UINT32_BE (data, 0x81ca0000);
+  gst_buffer_unmap (buffer, &map);
+
+  ret = gst_rtcp_buffer_map (buffer, GST_MAP_READ, &rtcp);
+  fail_unless (ret == TRUE, "Failed to map buffer");
+
+  ret = gst_rtcp_buffer_get_first_packet (&rtcp, &packet);
+  fail_unless (ret == TRUE, "Failed to get first packet");
+
+  /* This should fail because the packet is too short to contain a full SDES item */
+  ret = gst_rtcp_packet_sdes_get_entry (&packet, NULL, NULL, NULL);
+  fail_unless (ret == FALSE,
+      "sdes_get_entry should fail on truncated packet (case 1)");
+
+  gst_rtcp_buffer_unmap (&rtcp);
+  gst_buffer_unref (buffer);
+
+  /* Packet 2: Packet where item length field indicates more data than available */
+  buffer = gst_buffer_new_and_alloc (10);
+  gst_buffer_map (buffer, &map, GST_MAP_WRITE);
+  data = map.data;
+  /* V=2, P=0, RC=1, PT=202 (SDES), length=1 */
+  /* SSRC = 0x12345678 */
+  /* CNAME item, length = 5 (but only 0 bytes of text available) */
+  GST_WRITE_UINT32_BE (data, 0x81ca0001);
+  GST_WRITE_UINT32_BE (data + 4, 0x12345678);
+  data[8] = GST_RTCP_SDES_CNAME;
+  data[9] = 5;                  /* Malformed length */
+  gst_buffer_unmap (buffer, &map);
+
+  ret = gst_rtcp_buffer_map (buffer, GST_MAP_READ, &rtcp);
+  fail_unless (ret == TRUE, "Failed to map buffer");
+
+  ret = gst_rtcp_buffer_get_first_packet (&rtcp, &packet);
+  fail_unless (ret == TRUE, "Failed to get first packet");
+
+  /* This should fail because the item length is out of bounds */
+  ret = gst_rtcp_packet_sdes_get_entry (&packet, NULL, NULL, NULL);
+  fail_unless (ret == FALSE,
+      "sdes_get_entry should fail on out-of-bounds length (case 2)");
+
+  gst_rtcp_buffer_unmap (&rtcp);
+  gst_buffer_unref (buffer);
+}
+
+GST_END_TEST;
+
 static Suite *
 rtp_suite (void)
 {
@@ -2348,6 +2437,7 @@ rtp_suite (void)
   suite_add_tcase (s, tc_chain);
   tcase_add_test (tc_chain, test_rtp_buffer);
   tcase_add_test (tc_chain, test_rtp_buffer_validate_corrupt);
+  tcase_add_test (tc_chain, test_rtp_buffer_csrc_overflow);
   tcase_add_test (tc_chain, test_rtp_buffer_validate_padding);
   tcase_add_test (tc_chain, test_rtp_buffer_set_extension_data);
   //tcase_add_test (tc_chain, test_rtp_buffer_list_set_extension);
@@ -2396,6 +2486,8 @@ rtp_suite (void)
   tcase_add_test (tc_chain, test_rtp_buffer_extlen_wraparound);
   tcase_add_test (tc_chain, test_rtp_buffer_remove_extension_data);
   tcase_add_test (tc_chain, test_rtp_buffer_set_extension_data_shrink_data);
+
+  tcase_add_test (tc_chain, test_sdes_parsing_out_of_bounds);
 
   return s;
 }

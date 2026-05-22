@@ -405,6 +405,13 @@ public:
       *ret = (LPVOID *) static_cast<IDeckLinkVideoFrameMetadataExtensions *>(this);
       return S_OK;
     }
+    else if (memcmp (&iid, &IID_IDeckLinkVideoFrame, sizeof (iid))
+        == 0) {
+      AddRef ();
+      *ret = (LPVOID *) static_cast<IDeckLinkVideoFrame *>(this);
+      return S_OK;
+    }
+
     return E_NOINTERFACE;
   }
 
@@ -1149,8 +1156,9 @@ gst_decklink_video_sink_set_caps (GstBaseSink * bsink, GstCaps * caps)
   }
   g_mutex_unlock (&self->output->lock);
 
-  self->output->output->SetScheduledFrameCompletionCallback (new
-      GStreamerVideoOutputCallback (self));
+  GStreamerVideoOutputCallback *callback = new GStreamerVideoOutputCallback (self);
+  self->output->output->SetScheduledFrameCompletionCallback (callback);
+  callback->Release();
 
   if (self->mode == GST_DECKLINK_MODE_AUTO) {
     BMDPixelFormat f;

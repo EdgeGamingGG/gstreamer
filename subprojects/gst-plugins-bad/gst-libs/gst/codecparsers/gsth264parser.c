@@ -1847,18 +1847,26 @@ gst_h264_parser_identify_and_split_nalu_avc (GstH264NalParser * nalparser,
 GstH264ParserResult
 gst_h264_parser_parse_nal (GstH264NalParser * nalparser, GstH264NalUnit * nalu)
 {
-  GstH264SPS sps;
-  GstH264PPS pps;
+  GstH264ParserResult res = GST_H264_PARSER_OK;
 
   switch (nalu->type) {
-    case GST_H264_NAL_SPS:
-      return gst_h264_parser_parse_sps (nalparser, nalu, &sps);
+    case GST_H264_NAL_SPS:{
+      GstH264SPS sps;
+
+      res = gst_h264_parser_parse_sps (nalparser, nalu, &sps);
+      gst_h264_sps_clear (&sps);
       break;
-    case GST_H264_NAL_PPS:
-      return gst_h264_parser_parse_pps (nalparser, nalu, &pps);
+    }
+    case GST_H264_NAL_PPS:{
+      GstH264PPS pps;
+
+      res = gst_h264_parser_parse_pps (nalparser, nalu, &pps);
+      gst_h264_pps_clear (&pps);
+      break;
+    }
   }
 
-  return GST_H264_PARSER_OK;
+  return res;
 }
 
 /**
@@ -3993,6 +4001,7 @@ gst_h264_parser_skip_cabac_intra16x16 (GstH264CabacContext * cabac,
   return TRUE;
 }
 
+static gboolean
 gst_h264_parser_identify_cabac_p_ref_usage (const GstH264PPS * pps,
     const GstH264SPS * sps, GstH264NalUnit * nalu, GstH264SliceHdr * slice,
     guint32 total_mbs, guint32 * used_ref_mask_l0)

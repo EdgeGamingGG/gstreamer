@@ -2348,7 +2348,8 @@ gst_rmdemux_parse_video_packet (GstRMDemux * rmdemux, GstRMDemuxStream * stream,
     }
     GST_DEBUG_OBJECT (rmdemux, "fragment size %d", fragment_size);
 
-    if (map.size < (data - map.data) + fragment_size)
+    if (fragment_size > map.size
+        || (data - map.data) > map.size - fragment_size)
       goto not_enough_data;
 
     /* get the fragment */
@@ -2369,14 +2370,16 @@ gst_rmdemux_parse_video_packet (GstRMDemux * rmdemux, GstRMDemuxStream * stream,
       stream->frag_length = fragment_size;
     }
 
+    if (stream->frag_count >= MAX_FRAGS) {
+      gst_buffer_unref (fragment);
+      goto too_many_fragments;
+    }
+
     /* put fragment in adapter */
     gst_adapter_push (stream->adapter, fragment);
     stream->frag_offset[stream->frag_count] = stream->frag_current;
     stream->frag_current += fragment_size;
     stream->frag_count++;
-
-    if (stream->frag_count > MAX_FRAGS)
-      goto too_many_fragments;
 
     GST_DEBUG_OBJECT (rmdemux, "stored fragment in adapter %d/%d",
         stream->frag_current, stream->frag_length);
