@@ -552,7 +552,7 @@ gst_h264_parse_capture_picture_info (GstH264Parse * h264parse,
   info->mmco5_reset = gst_h264_parse_slice_has_mmco5 (slice);
   info->resets_dpb = is_idr || info->mmco5_reset;
   info->has_used_ref_mask_l0 =
-      gst_h264_parser_identify_slice_ref_usage (&h264parse->nalparser,
+      gst_h264_parser_identify_slice_ref_usage (h264parse->nalparser,
       (GstH264NalUnit *) nalu, (GstH264SliceHdr *) slice, &info->used_ref_mask_l0);
 
   if (!info->has_svc_extension && GST_H264_IS_P_SLICE (slice)) {

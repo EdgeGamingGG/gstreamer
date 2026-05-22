@@ -4001,6 +4001,7 @@ gst_h264_parser_skip_cabac_intra16x16 (GstH264CabacContext * cabac,
   return TRUE;
 }
 
+static gboolean
 gst_h264_parser_identify_cabac_p_ref_usage (const GstH264PPS * pps,
     const GstH264SPS * sps, GstH264NalUnit * nalu, GstH264SliceHdr * slice,
     guint32 total_mbs, guint32 * used_ref_mask_l0)
