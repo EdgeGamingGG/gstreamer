@@ -40,6 +40,7 @@ GST_DEBUG_CATEGORY (h264_parse_debug);
 #define DEFAULT_CONFIG_INTERVAL      (0)
 #define DEFAULT_UPDATE_TIMECODE       FALSE
 #define DEFAULT_TEMPORAL_SPS_FIXUP    FALSE
+#define DEFAULT_TEMPORAL_LAYER_COUNT  4
 #define GST_H264_TEMPORAL_META_NAME "GstH264TemporalMeta"
 
 enum
@@ -48,6 +49,7 @@ enum
   PROP_CONFIG_INTERVAL,
   PROP_UPDATE_TIMECODE,
   PROP_TEMPORAL_SPS_FIXUP,
+  PROP_TEMPORAL_LAYER_COUNT,
 };
 
 enum
@@ -187,6 +189,13 @@ gst_h264_parse_class_init (GstH264ParseClass * klass)
           DEFAULT_TEMPORAL_SPS_FIXUP,
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_TEMPORAL_LAYER_COUNT,
+      g_param_spec_uint ("temporal-layer-count",
+          "Temporal Layer Count",
+          "Number of hierarchical temporal layers used by plain AVC streams",
+          1, 4, DEFAULT_TEMPORAL_LAYER_COUNT,
+          G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+
   /* Override BaseParse vfuncs */
   parse_class->start = GST_DEBUG_FUNCPTR (gst_h264_parse_start);
   parse_class->stop = GST_DEBUG_FUNCPTR (gst_h264_parse_stop);
@@ -220,6 +229,7 @@ gst_h264_parse_init (GstH264Parse * h264parse)
   h264parse->aud_insert = TRUE;
   h264parse->update_timecode = DEFAULT_UPDATE_TIMECODE;
   h264parse->temporal_sps_fixup = DEFAULT_TEMPORAL_SPS_FIXUP;
+  h264parse->temporal_layer_count = DEFAULT_TEMPORAL_LAYER_COUNT;
 }
 
 static void
@@ -485,6 +495,42 @@ gst_h264_parse_picture_type_name (const GstH264ParsePictureInfo * info)
   }
 }
 
+static guint
+gst_h264_parse_temporal_period (const GstH264Parse * h264parse)
+{
+  guint layers = CLAMP (h264parse->temporal_layer_count, 1, 4);
+
+  return 1u << (layers - 1);
+}
+
+static guint8
+gst_h264_parse_temporal_id_from_poc (const GstH264Parse * h264parse,
+    gint32 display_poc, gboolean ref_pic_flag)
+{
+  guint layers = CLAMP (h264parse->temporal_layer_count, 1, 4);
+  guint period;
+  guint slot;
+  guint trailing_zeroes = 0;
+
+  if (layers <= 1)
+    return 0;
+
+  if (!ref_pic_flag)
+    return layers - 1;
+
+  period = gst_h264_parse_temporal_period (h264parse);
+  slot = ((guint) display_poc) & (period - 1);
+  if (slot == 0)
+    return 0;
+
+  while ((slot & 1) == 0) {
+    trailing_zeroes++;
+    slot >>= 1;
+  }
+
+  return (guint8) ((layers - 1) - trailing_zeroes);
+}
+
 static void
 gst_h264_parse_capture_picture_info (GstH264Parse * h264parse,
     const GstH264NalUnit * nalu, const GstH264SliceHdr * slice)
@@ -557,16 +603,15 @@ gst_h264_parse_capture_picture_info (GstH264Parse * h264parse,
 
   if (!info->has_svc_extension && GST_H264_IS_P_SLICE (slice)) {
     if (!info->ref_pic_flag && (info->display_poc & 1)) {
-      info->temporal_id = 3;
+      info->temporal_id =
+          gst_h264_parse_temporal_id_from_poc (h264parse, info->display_poc,
+          info->ref_pic_flag);
       h264parse->saw_nonref_poc_interleave = TRUE;
     } else if (h264parse->saw_nonref_poc_interleave &&
         info->ref_pic_flag && ((info->display_poc & 1) == 0)) {
-      if ((info->display_poc % 8) == 0)
-        info->temporal_id = 0;
-      else if ((info->display_poc % 4) == 0)
-        info->temporal_id = 1;
-      else
-        info->temporal_id = 2;
+      info->temporal_id =
+          gst_h264_parse_temporal_id_from_poc (h264parse, info->display_poc,
+          info->ref_pic_flag);
     }
   }
 
@@ -4784,6 +4829,9 @@ gst_h264_parse_set_property (GObject * object, guint prop_id,
       if (parse->nalparser != NULL)
         parse->nalparser->temporal_sps_fixup = parse->temporal_sps_fixup;
       break;
+    case PROP_TEMPORAL_LAYER_COUNT:
+      parse->temporal_layer_count = g_value_get_uint (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -4807,6 +4855,9 @@ gst_h264_parse_get_property (GObject * object, guint prop_id,
       break;
     case PROP_TEMPORAL_SPS_FIXUP:
       g_value_set_boolean (value, parse->temporal_sps_fixup);
+      break;
+    case PROP_TEMPORAL_LAYER_COUNT:
+      g_value_set_uint (value, parse->temporal_layer_count);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);

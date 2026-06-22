@@ -184,6 +184,7 @@ struct _GstH264Parse
   gint interval;
   gboolean update_timecode;
   gboolean temporal_sps_fixup;
+  guint temporal_layer_count;
 
   GstClockTime pending_key_unit_ts;
   GstEvent *force_key_unit_event;

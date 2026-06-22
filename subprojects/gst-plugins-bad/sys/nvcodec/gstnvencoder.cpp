@@ -2571,7 +2571,7 @@ gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
   const NV_ENC_CONFIG_H264 *h264;
   gboolean is_idr;
   gboolean gop_boundary = FALSE;
-  gboolean use_l1t4 = FALSE;
+  const gchar *decision_mode = "L1T1";
   guint temporal_layer = 0;
   guint ref_pic_flag = 1;
   guint64 display_poc;
@@ -2607,6 +2607,9 @@ gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
 
   if (!is_idr && h264->enableTemporalSVC) {
     if (h264->numTemporalLayers >= 4) {
+      /* These tables mirror driver-owned enablePTD=1 decisions observed by
+       * ltr_svc_probe. Index 0 is the base-layer frame at the start of a
+       * hierarchy period, so after an IDR the first P frame starts at index 1. */
       static const guint l1t4_tid[] = { 0, 3, 2, 3, 1, 3, 2, 3 };
       static const guint l1t4_ref[] = { 1, 0, 1, 0, 1, 0, 1, 0 };
       guint pattern_idx = (guint) (priv->ptd_gop_frame_idx %
@@ -2614,14 +2617,25 @@ gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
 
       temporal_layer = l1t4_tid[pattern_idx];
       ref_pic_flag = l1t4_ref[pattern_idx];
-      use_l1t4 = TRUE;
-    } else if (h264->numTemporalLayers > 1 &&
-        !priv->ptd_warned_layer_fallback) {
-      GST_INFO_OBJECT (self,
-          "PTD-disabled decision only has explicit L1T1/L1T4 policy; "
-          "falling back to L1T1 for numTemporalLayers=%u",
-          h264->numTemporalLayers);
-      priv->ptd_warned_layer_fallback = TRUE;
+      decision_mode = "L1T4";
+    } else if (h264->numTemporalLayers == 3) {
+      static const guint l1t3_tid[] = { 0, 2, 1, 2 };
+      static const guint l1t3_ref[] = { 1, 0, 1, 0 };
+      guint pattern_idx = (guint) (priv->ptd_gop_frame_idx %
+          G_N_ELEMENTS (l1t3_tid));
+
+      temporal_layer = l1t3_tid[pattern_idx];
+      ref_pic_flag = l1t3_ref[pattern_idx];
+      decision_mode = "L1T3";
+    } else if (h264->numTemporalLayers == 2) {
+      static const guint l1t2_tid[] = { 0, 1 };
+      static const guint l1t2_ref[] = { 1, 0 };
+      guint pattern_idx = (guint) (priv->ptd_gop_frame_idx %
+          G_N_ELEMENTS (l1t2_tid));
+
+      temporal_layer = l1t2_tid[pattern_idx];
+      ref_pic_flag = l1t2_ref[pattern_idx];
+      decision_mode = "L1T2";
     }
   }
 
@@ -2647,7 +2661,7 @@ gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
       frame->system_frame_number, priv->ptd_abs_frame_idx,
       priv->ptd_gop_frame_idx, (gint) decision.picture_type,
       decision.ref_pic_flag, decision.temporal_layer,
-      use_l1t4 ? "L1T4" : "L1T1", decision.encode_pic_flags);
+      decision_mode, decision.encode_pic_flags);
 
   priv->ptd_abs_frame_idx++;
   if (is_idr)
