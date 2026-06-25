@@ -109,6 +109,10 @@ typedef struct _GstNvEncH264PtdDecision
   guint32 ref_pic_flag;
   guint32 temporal_layer;
   guint32 encode_pic_flags;
+  gboolean ltr_mark_frame;
+  gboolean ltr_use_frames;
+  guint32 ltr_mark_frame_idx;
+  guint32 ltr_use_frame_bitmap;
 } GstNvEncH264PtdDecision;
 
 GType gst_nv_enc_task_get_type (void);

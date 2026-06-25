@@ -1886,8 +1886,12 @@ gst_h264_parser_parse_sps (GstH264NalParser * nalparser, GstH264NalUnit * nalu,
   GstH264ParserResult res = gst_h264_parse_sps (nalu, sps);
 
   if (res == GST_H264_PARSER_OK) {
-    if (nalparser->temporal_sps_fixup && sps->num_ref_frames == 3)
-      sps->num_ref_frames = 5;
+    if (nalparser->temporal_sps_fixup) {
+      if (nalparser->target_level_idc != 0)
+        sps->level_idc = nalparser->target_level_idc;
+      if (nalparser->target_max_num_ref_frames != 0)
+        sps->num_ref_frames = nalparser->target_max_num_ref_frames;
+    }
 
     GST_DEBUG ("adding sequence parameter set with id: %d to array", sps->id);
 
@@ -2206,8 +2210,12 @@ gst_h264_parser_parse_subset_sps (GstH264NalParser * nalparser,
 
   res = gst_h264_parse_subset_sps (nalu, sps);
   if (res == GST_H264_PARSER_OK) {
-    if (nalparser->temporal_sps_fixup && sps->num_ref_frames == 3)
-      sps->num_ref_frames = 5;
+    if (nalparser->temporal_sps_fixup) {
+      if (nalparser->target_level_idc != 0)
+        sps->level_idc = nalparser->target_level_idc;
+      if (nalparser->target_max_num_ref_frames != 0)
+        sps->num_ref_frames = nalparser->target_max_num_ref_frames;
+    }
 
     GST_DEBUG ("adding sequence parameter set with id: %d to array", sps->id);
 

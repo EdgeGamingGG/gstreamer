@@ -41,6 +41,8 @@ GST_DEBUG_CATEGORY (h264_parse_debug);
 #define DEFAULT_UPDATE_TIMECODE       FALSE
 #define DEFAULT_TEMPORAL_SPS_FIXUP    FALSE
 #define DEFAULT_TEMPORAL_LAYER_COUNT  4
+#define DEFAULT_TARGET_LEVEL_IDC      0
+#define DEFAULT_TARGET_MAX_NUM_REF_FRAMES 0
 #define GST_H264_TEMPORAL_META_NAME "GstH264TemporalMeta"
 
 enum
@@ -50,6 +52,8 @@ enum
   PROP_UPDATE_TIMECODE,
   PROP_TEMPORAL_SPS_FIXUP,
   PROP_TEMPORAL_LAYER_COUNT,
+  PROP_TARGET_LEVEL_IDC,
+  PROP_TARGET_MAX_NUM_REF_FRAMES,
 };
 
 enum
@@ -196,6 +200,20 @@ gst_h264_parse_class_init (GstH264ParseClass * klass)
           1, 4, DEFAULT_TEMPORAL_LAYER_COUNT,
           G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_TARGET_LEVEL_IDC,
+      g_param_spec_uint ("target-level-idc",
+          "Target Level IDC",
+          "When non-zero, rewrite SPS level_idc to this H.264 level byte",
+          0, 255, DEFAULT_TARGET_LEVEL_IDC,
+          G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_TARGET_MAX_NUM_REF_FRAMES,
+      g_param_spec_uint ("target-max-num-ref-frames",
+          "Target Max Num Ref Frames",
+          "When non-zero, rewrite SPS max_num_ref_frames when it fits in-place",
+          0, 16, DEFAULT_TARGET_MAX_NUM_REF_FRAMES,
+          G_PARAM_READWRITE | G_PARAM_CONSTRUCT | G_PARAM_STATIC_STRINGS));
+
   /* Override BaseParse vfuncs */
   parse_class->start = GST_DEBUG_FUNCPTR (gst_h264_parse_start);
   parse_class->stop = GST_DEBUG_FUNCPTR (gst_h264_parse_stop);
@@ -230,6 +248,8 @@ gst_h264_parse_init (GstH264Parse * h264parse)
   h264parse->update_timecode = DEFAULT_UPDATE_TIMECODE;
   h264parse->temporal_sps_fixup = DEFAULT_TEMPORAL_SPS_FIXUP;
   h264parse->temporal_layer_count = DEFAULT_TEMPORAL_LAYER_COUNT;
+  h264parse->target_level_idc = DEFAULT_TARGET_LEVEL_IDC;
+  h264parse->target_max_num_ref_frames = DEFAULT_TARGET_MAX_NUM_REF_FRAMES;
 }
 
 static void
@@ -720,6 +740,8 @@ gst_h264_parse_start (GstBaseParse * parse)
 
   h264parse->nalparser = gst_h264_nal_parser_new ();
   h264parse->nalparser->temporal_sps_fixup = h264parse->temporal_sps_fixup;
+  h264parse->nalparser->target_level_idc = (guint8) h264parse->target_level_idc;
+  h264parse->nalparser->target_max_num_ref_frames = h264parse->target_max_num_ref_frames;
 
   h264parse->state = 0;
   h264parse->dts = GST_CLOCK_TIME_NONE;
@@ -1083,7 +1105,38 @@ gst_h264_parse_locate_num_ref_frames_bits (const guint8 * rbsp,
 }
 
 static gboolean
+gst_h264_parse_build_ue_bits (guint32 value, guint8 * bits, guint max_bits,
+    guint * bit_count)
+{
+  guint32 code_num = value + 1;
+  guint leading_zero_bits = 0;
+  guint32 tmp = code_num;
+  guint idx = 0;
+  guint i;
+
+  g_return_val_if_fail (bits != NULL, FALSE);
+  g_return_val_if_fail (bit_count != NULL, FALSE);
+
+  while (tmp > 1) {
+    leading_zero_bits++;
+    tmp >>= 1;
+  }
+
+  *bit_count = leading_zero_bits * 2 + 1;
+  if (*bit_count > max_bits)
+    return FALSE;
+
+  for (i = 0; i < leading_zero_bits; i++)
+    bits[idx++] = 0;
+  for (i = 0; i <= leading_zero_bits; i++)
+    bits[idx++] = (code_num >> (leading_zero_bits - i)) & 1u;
+
+  return TRUE;
+}
+
+static gboolean
 gst_h264_parse_rewrite_temporal_sps_nal (const guint8 * nal_data, guint nal_size,
+    guint target_level_idc, guint target_max_num_ref_frames,
     guint8 ** patched_data, guint * patched_size)
 {
   const guint8 *payload;
@@ -1096,7 +1149,9 @@ gst_h264_parse_rewrite_temporal_sps_nal (const guint8 * nal_data, guint nal_size
   guint start_bit = 0, end_bit = 0;
   guint32 current_value = 0;
   guint8 *out = NULL;
-  static const guint8 ue_5_bits[5] = { 0, 0, 1, 1, 0 };
+  guint8 ref_bits[32] = { 0, };
+  guint ref_bit_count = 0;
+  gboolean changed = FALSE;
   guint i;
 
   g_return_val_if_fail (patched_data != NULL, FALSE);
@@ -1135,25 +1190,45 @@ gst_h264_parse_rewrite_temporal_sps_nal (const guint8 * nal_data, guint nal_size
           &end_bit, &current_value))
     goto done;
 
-  if (current_value != 3 || end_bit <= start_bit || (end_bit - start_bit) != 5)
+  if (target_level_idc == 0 && target_max_num_ref_frames == 0)
     goto done;
 
   out = g_memdup2 (nal_data, nal_size);
-  for (i = 0; i < 5; i++) {
-    guint bit_idx = start_bit + i;
-    guint rbsp_byte_idx = bit_idx >> 3;
-    guint payload_byte_idx = rbsp_to_payload[rbsp_byte_idx];
-    guint8 mask = 1u << (7 - (bit_idx & 7));
 
-    if (ue_5_bits[i] != 0)
-      out[payload_byte_idx] |= mask;
-    else
-      out[payload_byte_idx] &= ~mask;
+  if (target_level_idc != 0 && rbsp_size >= 3) {
+    out[rbsp_to_payload[2]] = (guint8) target_level_idc;
+    changed = TRUE;
   }
 
-  *patched_data = out;
-  *patched_size = nal_size;
-  out = NULL;
+  if (target_max_num_ref_frames != 0 && target_max_num_ref_frames != current_value) {
+    guint current_bit_count = end_bit - start_bit;
+    if (!gst_h264_parse_build_ue_bits (target_max_num_ref_frames, ref_bits,
+            G_N_ELEMENTS (ref_bits), &ref_bit_count) ||
+        ref_bit_count != current_bit_count) {
+      GST_WARNING ("Skipping temporal SPS max_num_ref_frames rewrite from %u to %u because bit width changes from %u to %u",
+          current_value, target_max_num_ref_frames, current_bit_count,
+          ref_bit_count);
+    } else {
+      for (i = 0; i < ref_bit_count; i++) {
+        guint bit_idx = start_bit + i;
+        guint rbsp_byte_idx = bit_idx >> 3;
+        guint payload_byte_idx = rbsp_to_payload[rbsp_byte_idx];
+        guint8 mask = 1u << (7 - (bit_idx & 7));
+
+        if (ref_bits[i] != 0)
+          out[payload_byte_idx] |= mask;
+        else
+          out[payload_byte_idx] &= ~mask;
+      }
+      changed = TRUE;
+    }
+  }
+
+  if (changed) {
+    *patched_data = out;
+    *patched_size = nal_size;
+    out = NULL;
+  }
 
 done:
   g_free (out);
@@ -1221,6 +1296,8 @@ gst_h264_parse_rewrite_temporal_sps_in_buffer (GstH264Parse * h264parse,
 
     if ((nal_type == GST_H264_NAL_SPS || nal_type == GST_H264_NAL_SUBSET_SPS) &&
         gst_h264_parse_rewrite_temporal_sps_nal (map.data + nal_start, nal_size,
+            h264parse->target_level_idc,
+            h264parse->target_max_num_ref_frames,
             &patched_data, &patched_size)) {
       if (patched_size == nal_size) {
         memcpy (map.data + nal_start, patched_data, nal_size);
@@ -1299,6 +1376,8 @@ gst_h264_parser_store_nal (GstH264Parse * h264parse, guint id,
   if (h264parse->temporal_sps_fixup &&
       (naltype == GST_H264_NAL_SPS || naltype == GST_H264_NAL_SUBSET_SPS) &&
       gst_h264_parse_rewrite_temporal_sps_nal (nalu->data + nalu->offset, size,
+          h264parse->target_level_idc,
+          h264parse->target_max_num_ref_frames,
           &patched_data, &patched_size)) {
     buf = gst_buffer_new_allocate (NULL, patched_size, NULL);
     gst_buffer_fill (buf, 0, patched_data, patched_size);
@@ -4832,6 +4911,17 @@ gst_h264_parse_set_property (GObject * object, guint prop_id,
     case PROP_TEMPORAL_LAYER_COUNT:
       parse->temporal_layer_count = g_value_get_uint (value);
       break;
+    case PROP_TARGET_LEVEL_IDC:
+      parse->target_level_idc = g_value_get_uint (value);
+      if (parse->nalparser != NULL)
+        parse->nalparser->target_level_idc = (guint8) parse->target_level_idc;
+      break;
+    case PROP_TARGET_MAX_NUM_REF_FRAMES:
+      parse->target_max_num_ref_frames = g_value_get_uint (value);
+      if (parse->nalparser != NULL)
+        parse->nalparser->target_max_num_ref_frames =
+            parse->target_max_num_ref_frames;
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -4858,6 +4948,12 @@ gst_h264_parse_get_property (GObject * object, guint prop_id,
       break;
     case PROP_TEMPORAL_LAYER_COUNT:
       g_value_set_uint (value, parse->temporal_layer_count);
+      break;
+    case PROP_TARGET_LEVEL_IDC:
+      g_value_set_uint (value, parse->target_level_idc);
+      break;
+    case PROP_TARGET_MAX_NUM_REF_FRAMES:
+      g_value_set_uint (value, parse->target_max_num_ref_frames);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);

@@ -132,7 +132,8 @@ struct GstNvEncTask : public GstMiniObject
   guint seq_num;
 
   GArray *sei_payload;
-  GstNvEncH264PtdDecision h264_ptd = { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0 };
+  GstNvEncH264PtdDecision h264_ptd =
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
 };
 
 GST_DEFINE_MINI_OBJECT_TYPE (GstNvEncTask, gst_nv_enc_task);
@@ -430,7 +431,8 @@ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
   guint retry_count = 0;
   const guint retry_threshold = 100;
   NV_ENC_PIC_PARAMS params = { 0, };
-  GstNvEncH264PtdDecision h264_ptd = { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0 };
+  GstNvEncH264PtdDecision h264_ptd =
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
 
   std::unique_lock <std::mutex> lk (lock_);
 
@@ -482,12 +484,24 @@ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
         h264_ptd.display_poc_syntax;
     params.codecPicParams.h264PicParams.refPicFlag = h264_ptd.ref_pic_flag;
     params.encodePicFlags |= h264_ptd.encode_pic_flags;
+    if (h264_ptd.ltr_mark_frame) {
+      params.codecPicParams.h264PicParams.ltrMarkFrame = 1;
+      params.codecPicParams.h264PicParams.ltrMarkFrameIdx =
+          h264_ptd.ltr_mark_frame_idx;
+    }
+    if (h264_ptd.ltr_use_frames && h264_ptd.ltr_use_frame_bitmap != 0) {
+      params.codecPicParams.h264PicParams.ltrUseFrames = 1;
+      params.codecPicParams.h264PicParams.ltrUseFrameBitmap =
+          h264_ptd.ltr_use_frame_bitmap;
+    }
 
     GST_LOG_ID (id_.c_str (),
-        "Apply H264 PTD decision frame=%u type=%d ref=%u poc=%u tl=%u flags=0x%x",
+        "Apply H264 PTD decision frame=%u type=%d ref=%u poc=%u tl=%u flags=0x%x ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
         codec_frame->system_frame_number, (gint) h264_ptd.picture_type,
         h264_ptd.ref_pic_flag, h264_ptd.display_poc_syntax,
-        h264_ptd.temporal_layer, h264_ptd.encode_pic_flags);
+        h264_ptd.temporal_layer, h264_ptd.encode_pic_flags,
+        h264_ptd.ltr_mark_frame ? 1 : 0, h264_ptd.ltr_mark_frame_idx,
+        h264_ptd.ltr_use_frames ? 1 : 0, h264_ptd.ltr_use_frame_bitmap);
   }
 
   if (GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (codec_frame))

@@ -1473,6 +1473,8 @@ struct _GstH264NalParser
   GstH264SPS *last_sps;
   GstH264PPS *last_pps;
   gboolean temporal_sps_fixup;
+  guint8 target_level_idc;
+  guint32 target_max_num_ref_frames;
 };
 
 GST_CODEC_PARSERS_API

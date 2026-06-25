@@ -60,6 +60,7 @@ GST_DEBUG_CATEGORY (gst_nv_encoder_debug);
 #define GST_NVENC_STATUS_FORMAT "s (%d)"
 #define GST_NVENC_STATUS_ARGS(s) nvenc_status_to_string (s), s
 #define GST_H264_TEMPORAL_META_NAME "GstH264TemporalMeta"
+#define GST_NVENC_LTR_META_NAME "GstNvEncoderLTRMeta"
 
 enum
 {
@@ -2562,12 +2563,67 @@ gst_nv_encoder_get_h264_parser_ptd_decision (GstNvEncoder * self,
 }
 
 static void
+gst_nv_encoder_apply_h264_ltr_meta (GstNvEncoder * self,
+    GstVideoCodecFrame * frame, GstNvEncH264PtdDecision * decision)
+{
+  GstCustomMeta *meta;
+  GstStructure *s;
+  gboolean mark_frame = FALSE;
+  gboolean use_frames = FALSE;
+  guint mark_idx = 0;
+  guint use_bitmap = 0;
+
+  g_return_if_fail (decision != NULL);
+
+  if (frame == NULL || frame->input_buffer == NULL)
+    return;
+
+  meta = gst_buffer_get_custom_meta (frame->input_buffer,
+      GST_NVENC_LTR_META_NAME);
+  if (meta == NULL)
+    return;
+
+  s = gst_custom_meta_get_structure (meta);
+  if (s == NULL)
+    return;
+
+  gst_structure_get_boolean (s, "ltr-mark-frame", &mark_frame);
+  gst_structure_get_boolean (s, "ltr-use-frames", &use_frames);
+  gst_structure_get_uint (s, "ltr-mark-frame-idx", &mark_idx);
+  gst_structure_get_uint (s, "ltr-use-frame-bitmap", &use_bitmap);
+
+  if (decision->picture_type == NV_ENC_PIC_TYPE_IDR) {
+    GST_LOG_OBJECT (self,
+        "Ignoring LTR metadata on IDR frame=%u mark=%d idx=%u use=%d bitmap=0x%x",
+        frame->system_frame_number, mark_frame ? 1 : 0, mark_idx,
+        use_frames ? 1 : 0, use_bitmap);
+    return;
+  }
+
+  if (mark_frame) {
+    decision->ltr_mark_frame = TRUE;
+    decision->ltr_mark_frame_idx = mark_idx;
+  }
+  if (use_frames && use_bitmap != 0) {
+    decision->ltr_use_frames = TRUE;
+    decision->ltr_use_frame_bitmap = use_bitmap;
+  }
+
+  if (mark_frame || (use_frames && use_bitmap != 0)) {
+    GST_LOG_OBJECT (self,
+        "Using LTR metadata frame=%u mark=%d idx=%u use=%d bitmap=0x%x",
+        frame->system_frame_number, mark_frame ? 1 : 0, mark_idx,
+        use_frames ? 1 : 0, use_bitmap);
+  }
+}
+
+static void
 gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
     GstVideoCodecFrame * frame, GstNvEncTask * task)
 {
   GstNvEncoderPrivate *priv = self->priv;
   GstNvEncH264PtdDecision decision =
-      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0 };
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
   const NV_ENC_CONFIG_H264 *h264;
   gboolean is_idr;
   gboolean gop_boundary = FALSE;
@@ -2583,6 +2639,7 @@ gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
     return;
 
   if (gst_nv_encoder_get_h264_parser_ptd_decision (self, frame, &decision)) {
+    gst_nv_encoder_apply_h264_ltr_meta (self, frame, &decision);
     gst_nv_enc_task_set_h264_ptd_decision (task, &decision);
 
     priv->ptd_abs_frame_idx++;
@@ -2653,6 +2710,7 @@ gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
       decision.encode_pic_flags |= NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
   }
 
+  gst_nv_encoder_apply_h264_ltr_meta (self, frame, &decision);
   gst_nv_enc_task_set_h264_ptd_decision (task, &decision);
 
   GST_LOG_OBJECT (self,
