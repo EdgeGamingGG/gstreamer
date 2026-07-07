@@ -531,6 +531,15 @@ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
   } while (true);
 
   if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
+    GST_ERROR_ID (id_.c_str (),
+        "NvEncEncodePicture failed status=%d frame=%u pts=%" G_GINT64_FORMAT " duration=%" G_GINT64_FORMAT " h264_ptd_valid=%d type=%d ref=%u poc=%u tl=%u flags=0x%x ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
+        (gint) status, codec_frame->system_frame_number,
+        (gint64) codec_frame->pts, (gint64) codec_frame->duration,
+        h264_ptd.valid ? 1 : 0, (gint) h264_ptd.picture_type,
+        h264_ptd.ref_pic_flag, h264_ptd.display_poc_syntax,
+        h264_ptd.temporal_layer, h264_ptd.encode_pic_flags,
+        h264_ptd.ltr_mark_frame ? 1 : 0, h264_ptd.ltr_mark_frame_idx,
+        h264_ptd.ltr_use_frames ? 1 : 0, h264_ptd.ltr_use_frame_bitmap);
     NVENC_IS_SUCCESS (status, this);
     lk.unlock ();
     gst_nv_enc_task_unref (task);
@@ -1264,7 +1273,17 @@ gst_nv_enc_task_lock_bitstream (GstNvEncTask * task,
   status = task->object->LockBitstream (&task->bitstream);
 
   if (!NVENC_IS_SUCCESS (status, task->object.get ()))
+  {
+    GST_ERROR_ID (task->id.c_str (),
+        "NvEncLockBitstream failed status=%d frame=%u h264_ptd_valid=%d type=%d ref=%u poc=%u tl=%u flags=0x%x ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
+        (gint) status, task->seq_num,
+        task->h264_ptd.valid ? 1 : 0, (gint) task->h264_ptd.picture_type,
+        task->h264_ptd.ref_pic_flag, task->h264_ptd.display_poc_syntax,
+        task->h264_ptd.temporal_layer, task->h264_ptd.encode_pic_flags,
+        task->h264_ptd.ltr_mark_frame ? 1 : 0, task->h264_ptd.ltr_mark_frame_idx,
+        task->h264_ptd.ltr_use_frames ? 1 : 0, task->h264_ptd.ltr_use_frame_bitmap);
     return status;
+  }
 
   task->locked = true;
   *bitstream = task->bitstream;

@@ -185,6 +185,93 @@ static gboolean gst_nv_encoder_transform_meta (GstVideoEncoder * encoder,
     GstVideoCodecFrame * frame, GstMeta * meta);
 static void gst_nv_encoder_update_min_pts (GstNvEncoder * self);
 
+static gboolean
+gst_nv_encoder_get_task_h264_ptd_decision (GstNvEncTask * task,
+    GstNvEncH264PtdDecision * decision)
+{
+  static const GstNvEncH264PtdDecision default_decision =
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
+
+  g_return_val_if_fail (decision, FALSE);
+
+  *decision = default_decision;
+  if (!task)
+    return FALSE;
+
+  return gst_nv_enc_task_get_h264_ptd_decision (task, decision);
+}
+
+static GstStructure *
+gst_nv_encoder_build_nvenc_error_details (const gchar * api,
+    NVENCSTATUS status, GstVideoCodecFrame * frame,
+    const GstNvEncH264PtdDecision * h264_ptd, gboolean h264_ptd_valid)
+{
+  const GstNvEncH264PtdDecision fallback_decision =
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
+  const GstNvEncH264PtdDecision *ptd = h264_ptd ? h264_ptd :
+      &fallback_decision;
+  const gchar *status_name = nvenc_status_to_string (status);
+  GstClockTime pts = frame ? frame->pts : GST_CLOCK_TIME_NONE;
+  GstClockTime duration = frame ? frame->duration : GST_CLOCK_TIME_NONE;
+
+  return gst_structure_new ("ludeocast-nvenc-error-details",
+      "component", G_TYPE_STRING, "nvenc",
+      "api", G_TYPE_STRING, api ? api : "",
+      "status", G_TYPE_INT, (gint) status,
+      "statusName", G_TYPE_STRING, status_name ? status_name : "",
+      "frameNumber", G_TYPE_UINT, frame ? frame->system_frame_number : 0,
+      "pts", G_TYPE_INT64, (gint64) pts,
+      "ptsValid", G_TYPE_BOOLEAN, GST_CLOCK_TIME_IS_VALID (pts),
+      "duration", G_TYPE_INT64, (gint64) duration,
+      "durationValid", G_TYPE_BOOLEAN, GST_CLOCK_TIME_IS_VALID (duration),
+      "h264PtdValid", G_TYPE_BOOLEAN, h264_ptd_valid,
+      "pictureType", G_TYPE_INT, (gint) ptd->picture_type,
+      "refPicFlag", G_TYPE_UINT, ptd->ref_pic_flag,
+      "poc", G_TYPE_UINT, ptd->display_poc_syntax,
+      "temporalLayer", G_TYPE_UINT, ptd->temporal_layer,
+      "encodePicFlags", G_TYPE_UINT, ptd->encode_pic_flags,
+      "ltrMarkFrame", G_TYPE_BOOLEAN, ptd->ltr_mark_frame,
+      "ltrMarkFrameIdx", G_TYPE_UINT, ptd->ltr_mark_frame_idx,
+      "ltrUseFrames", G_TYPE_BOOLEAN, ptd->ltr_use_frames,
+      "ltrUseFrameBitmap", G_TYPE_UINT, ptd->ltr_use_frame_bitmap,
+      nullptr);
+}
+
+static void
+gst_nv_encoder_post_nvenc_error (GstNvEncoder * self, const gchar * api,
+    NVENCSTATUS status, GstVideoCodecFrame * frame,
+    const GstNvEncH264PtdDecision * h264_ptd, gboolean h264_ptd_valid,
+    const gchar * file, const gchar * function, gint line)
+{
+  const GstNvEncH264PtdDecision fallback_decision =
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
+  const GstNvEncH264PtdDecision *ptd = h264_ptd ? h264_ptd :
+      &fallback_decision;
+  const gchar *status_name = nvenc_status_to_string (status);
+  GstClockTime pts = frame ? frame->pts : GST_CLOCK_TIME_NONE;
+  GstClockTime duration = frame ? frame->duration : GST_CLOCK_TIME_NONE;
+
+  gst_element_message_full_with_details (GST_ELEMENT (self),
+      GST_MESSAGE_ERROR, GST_STREAM_ERROR, GST_STREAM_ERROR_ENCODE,
+      g_strdup_printf ("NVENC %s failed: %s", api ? api : "operation",
+          status_name ? status_name : "unknown"),
+      g_strdup_printf ("%s failed status=%d frame=%u pts=%" G_GINT64_FORMAT
+          " duration=%" G_GINT64_FORMAT
+          " h264_ptd_valid=%d type=%d ref=%u poc=%u tl=%u flags=0x%x"
+          " ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
+          api ? api : "NVENC operation", (gint) status,
+          frame ? frame->system_frame_number : 0, (gint64) pts,
+          (gint64) duration, h264_ptd_valid ? 1 : 0,
+          (gint) ptd->picture_type, ptd->ref_pic_flag,
+          ptd->display_poc_syntax, ptd->temporal_layer,
+          ptd->encode_pic_flags, ptd->ltr_mark_frame ? 1 : 0,
+          ptd->ltr_mark_frame_idx, ptd->ltr_use_frames ? 1 : 0,
+          ptd->ltr_use_frame_bitmap),
+      file, function, line,
+      gst_nv_encoder_build_nvenc_error_details (api, status, frame, ptd,
+          h264_ptd_valid));
+}
+
 /* ---- GUID-to-string helper for JSON serialisation ---- */
 static gchar *
 guid_to_string (const GUID * g)
@@ -1288,11 +1375,14 @@ gst_nv_encoder_thread_func (GstNvEncoder * self)
 
     status = gst_nv_enc_task_lock_bitstream (task, &bitstream);
     if (status != NV_ENC_SUCCESS) {
+      GstNvEncH264PtdDecision h264_ptd;
+      gboolean h264_ptd_valid =
+          gst_nv_encoder_get_task_h264_ptd_decision (task, &h264_ptd);
+
+      gst_nv_encoder_post_nvenc_error (self, "NvEncLockBitstream", status,
+          frame, &h264_ptd, h264_ptd_valid, __FILE__, GST_FUNCTION, __LINE__);
       gst_nv_enc_task_unref (task);
       gst_video_encoder_release_frame (encoder, frame);
-      GST_ELEMENT_ERROR (self, STREAM, ENCODE, (NULL),
-          ("Failed to lock bitstream, status: %" GST_NVENC_STATUS_FORMAT,
-              GST_NVENC_STATUS_ARGS (status)));
       priv->last_flow = GST_FLOW_ERROR;
       continue;
     }
@@ -2828,11 +2918,16 @@ gst_nv_encoder_handle_frame (GstVideoEncoder * encoder,
   }
 
   gst_nv_encoder_prepare_h264_ptd_decision (self, frame, task);
+  GstNvEncH264PtdDecision encode_h264_ptd;
+  gboolean encode_h264_ptd_valid =
+      gst_nv_encoder_get_task_h264_ptd_decision (task, &encode_h264_ptd);
 
   status = priv->object->Encode (frame,
       gst_nv_encoder_get_pic_struct (self, in_buf), task);
   if (status != NV_ENC_SUCCESS) {
-    GST_ERROR_OBJECT (self, "Failed to encode frame");
+    gst_nv_encoder_post_nvenc_error (self, "NvEncEncodePicture", status,
+        frame, &encode_h264_ptd, encode_h264_ptd_valid, __FILE__,
+        GST_FUNCTION, __LINE__);
     gst_video_encoder_release_frame (encoder, frame);
 
     return GST_FLOW_ERROR;
