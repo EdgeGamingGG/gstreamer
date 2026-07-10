@@ -62,6 +62,7 @@ GST_DEBUG_CATEGORY (gst_nv_encoder_debug);
 #define GST_NVENC_STATUS_ARGS(s) nvenc_status_to_string (s), s
 #define GST_H264_TEMPORAL_META_NAME "GstH264TemporalMeta"
 #define GST_NVENC_LTR_META_NAME "GstNvEncoderLTRMeta"
+#define GST_LUDEO_H264_PTD_DECISION_META_NAME "GstLudeoH264PtdDecisionMeta"
 
 enum
 {
@@ -342,6 +343,67 @@ gst_nv_encoder_post_h264_ptd_error (GstNvEncoder * self,
           frame ? frame->system_frame_number : 0, message),
       file, function, line,
       gst_nv_encoder_build_h264_ptd_error_details (frame, result));
+}
+
+static gboolean
+gst_nv_encoder_ensure_h264_ptd_decision_meta_registered ()
+{
+  static gsize init_once = 0;
+
+  if (g_once_init_enter (&init_once)) {
+    const GstMetaInfo *info =
+        gst_meta_get_info (GST_LUDEO_H264_PTD_DECISION_META_NAME);
+    if (info == nullptr)
+      info = gst_meta_register_custom_simple
+          (GST_LUDEO_H264_PTD_DECISION_META_NAME);
+    g_once_init_leave (&init_once, info ? 1 : 2);
+  }
+
+  return gst_meta_get_info (GST_LUDEO_H264_PTD_DECISION_META_NAME) != nullptr;
+}
+
+static void
+gst_nv_encoder_attach_h264_ptd_decision_meta (GstBuffer * buffer,
+    const GstNvEncH264PtdDecision * decision)
+{
+  GstCustomMeta *meta;
+  GstStructure *structure;
+
+  if (buffer == nullptr || decision == nullptr || !decision->valid)
+    return;
+
+  if (!gst_nv_encoder_ensure_h264_ptd_decision_meta_registered ())
+    return;
+
+  meta = gst_buffer_add_custom_meta (buffer,
+      GST_LUDEO_H264_PTD_DECISION_META_NAME);
+  if (meta == nullptr)
+    return;
+
+  structure = gst_custom_meta_get_structure (meta);
+  if (structure == nullptr)
+    return;
+
+  gst_structure_set (structure,
+      "ptd-owner", G_TYPE_UINT, (guint) decision->owner,
+      "picture-type", G_TYPE_UINT, (guint) decision->picture_type,
+      "ref-pic-flag", G_TYPE_UINT, decision->ref_pic_flag,
+      "poc", G_TYPE_UINT, decision->display_poc_syntax,
+      "temporal-layer", G_TYPE_UINT, decision->temporal_layer,
+      "encode-pic-flags", G_TYPE_UINT, decision->encode_pic_flags,
+      "is-idr", G_TYPE_BOOLEAN, decision->is_idr,
+      "gop-boundary", G_TYPE_BOOLEAN, decision->gop_boundary,
+      "abs-frame-idx-before", G_TYPE_UINT64, decision->abs_frame_idx_before,
+      "gop-frame-idx-before", G_TYPE_UINT64, decision->gop_frame_idx_before,
+      "pattern-idx", G_TYPE_UINT, decision->pattern_idx,
+      "temporal-layers", G_TYPE_UINT, decision->temporal_layers,
+      "temporal-svc-enabled", G_TYPE_BOOLEAN,
+      decision->temporal_svc_enabled,
+      "ltr-mark-frame", G_TYPE_BOOLEAN, decision->ltr_mark_frame,
+      "ltr-mark-frame-idx", G_TYPE_UINT, decision->ltr_mark_frame_idx,
+      "ltr-use-frames", G_TYPE_BOOLEAN, decision->ltr_use_frames,
+      "ltr-use-frame-bitmap", G_TYPE_UINT, decision->ltr_use_frame_bitmap,
+      nullptr);
 }
 
 /* ---- GUID-to-string helper for JSON serialisation ---- */
@@ -1428,6 +1490,8 @@ gst_nv_encoder_thread_func (GstNvEncoder * self)
     GstNvEncTask *task = nullptr;
     GstVideoCodecFrame *frame;
     NV_ENC_LOCK_BITSTREAM bitstream;
+    GstNvEncH264PtdDecision h264_ptd;
+    gboolean h264_ptd_valid = FALSE;
     NVENCSTATUS status;
 
     ret = object->GetOutput (&task);
@@ -1446,12 +1510,11 @@ gst_nv_encoder_thread_func (GstNvEncoder * self)
       continue;
     }
 
+    h264_ptd_valid = gst_nv_encoder_get_task_h264_ptd_decision (task,
+        &h264_ptd);
+
     status = gst_nv_enc_task_lock_bitstream (task, &bitstream);
     if (status != NV_ENC_SUCCESS) {
-      GstNvEncH264PtdDecision h264_ptd;
-      gboolean h264_ptd_valid =
-          gst_nv_encoder_get_task_h264_ptd_decision (task, &h264_ptd);
-
       gst_nv_encoder_post_nvenc_error (self, "NvEncLockBitstream", status,
           frame, &h264_ptd, h264_ptd_valid, __FILE__, GST_FUNCTION, __LINE__);
       gst_nv_enc_task_unref (task);
@@ -1474,6 +1537,8 @@ gst_nv_encoder_thread_func (GstNvEncoder * self)
           gst_buffer_new_memdup (bitstream.bitstreamBufferPtr,
           bitstream.bitstreamSizeInBytes);
     }
+    gst_nv_encoder_attach_h264_ptd_decision_meta (frame->output_buffer,
+        h264_ptd_valid ? &h264_ptd : nullptr);
 
     GST_BUFFER_FLAG_SET (frame->output_buffer, GST_BUFFER_FLAG_MARKER);
 
