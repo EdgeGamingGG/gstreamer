@@ -496,10 +496,15 @@ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
     }
 
     GST_LOG_ID (id_.c_str (),
-        "Apply H264 PTD decision frame=%u type=%d ref=%u poc=%u tl=%u flags=0x%x ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
-        codec_frame->system_frame_number, (gint) h264_ptd.picture_type,
-        h264_ptd.ref_pic_flag, h264_ptd.display_poc_syntax,
-        h264_ptd.temporal_layer, h264_ptd.encode_pic_flags,
+        "Apply H264 PTD decision frame=%u owner=%s abs=%" G_GUINT64_FORMAT
+        " gop=%" G_GUINT64_FORMAT " type=%d ref=%u poc=%u tl=%u flags=0x%x"
+        " ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
+        codec_frame->system_frame_number,
+        gst_nv_h264_ptd_owner_to_string (h264_ptd.owner),
+        h264_ptd.abs_frame_idx_before, h264_ptd.gop_frame_idx_before,
+        (gint) h264_ptd.picture_type, h264_ptd.ref_pic_flag,
+        h264_ptd.display_poc_syntax, h264_ptd.temporal_layer,
+        h264_ptd.encode_pic_flags,
         h264_ptd.ltr_mark_frame ? 1 : 0, h264_ptd.ltr_mark_frame_idx,
         h264_ptd.ltr_use_frames ? 1 : 0, h264_ptd.ltr_use_frame_bitmap);
   }
@@ -532,12 +537,19 @@ GstNvEncObject::Encode (GstVideoCodecFrame * codec_frame,
 
   if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
     GST_ERROR_ID (id_.c_str (),
-        "NvEncEncodePicture failed status=%d frame=%u pts=%" G_GINT64_FORMAT " duration=%" G_GINT64_FORMAT " h264_ptd_valid=%d type=%d ref=%u poc=%u tl=%u flags=0x%x ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
+        "NvEncEncodePicture failed status=%d frame=%u pts=%" G_GINT64_FORMAT
+        " duration=%" G_GINT64_FORMAT
+        " h264_ptd_valid=%d owner=%s abs=%" G_GUINT64_FORMAT
+        " gop=%" G_GUINT64_FORMAT " type=%d ref=%u poc=%u tl=%u flags=0x%x"
+        " ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
         (gint) status, codec_frame->system_frame_number,
         (gint64) codec_frame->pts, (gint64) codec_frame->duration,
-        h264_ptd.valid ? 1 : 0, (gint) h264_ptd.picture_type,
-        h264_ptd.ref_pic_flag, h264_ptd.display_poc_syntax,
-        h264_ptd.temporal_layer, h264_ptd.encode_pic_flags,
+        h264_ptd.valid ? 1 : 0,
+        gst_nv_h264_ptd_owner_to_string (h264_ptd.owner),
+        h264_ptd.abs_frame_idx_before, h264_ptd.gop_frame_idx_before,
+        (gint) h264_ptd.picture_type, h264_ptd.ref_pic_flag,
+        h264_ptd.display_poc_syntax, h264_ptd.temporal_layer,
+        h264_ptd.encode_pic_flags,
         h264_ptd.ltr_mark_frame ? 1 : 0, h264_ptd.ltr_mark_frame_idx,
         h264_ptd.ltr_use_frames ? 1 : 0, h264_ptd.ltr_use_frame_bitmap);
     NVENC_IS_SUCCESS (status, this);
@@ -1004,12 +1016,14 @@ GstNvEncObject::AcquireTask (GstNvEncTask ** task, bool force)
 
   new_task->object = shared_from_this ();
   g_array_set_size (new_task->sei_payload, 0);
+  new_task->h264_ptd = {};
   new_task->h264_ptd.valid = FALSE;
   new_task->h264_ptd.picture_type = NV_ENC_PIC_TYPE_P;
   new_task->h264_ptd.display_poc_syntax = 0;
   new_task->h264_ptd.ref_pic_flag = 1;
   new_task->h264_ptd.temporal_layer = 0;
   new_task->h264_ptd.encode_pic_flags = 0;
+  new_task->h264_ptd.owner = GST_NV_H264_PTD_OWNER_UNSET;
 
   *task = new_task;
 
@@ -1275,13 +1289,22 @@ gst_nv_enc_task_lock_bitstream (GstNvEncTask * task,
   if (!NVENC_IS_SUCCESS (status, task->object.get ()))
   {
     GST_ERROR_ID (task->id.c_str (),
-        "NvEncLockBitstream failed status=%d frame=%u h264_ptd_valid=%d type=%d ref=%u poc=%u tl=%u flags=0x%x ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
+        "NvEncLockBitstream failed status=%d frame=%u h264_ptd_valid=%d"
+        " owner=%s abs=%" G_GUINT64_FORMAT " gop=%" G_GUINT64_FORMAT
+        " type=%d ref=%u poc=%u tl=%u flags=0x%x"
+        " ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
         (gint) status, task->seq_num,
-        task->h264_ptd.valid ? 1 : 0, (gint) task->h264_ptd.picture_type,
-        task->h264_ptd.ref_pic_flag, task->h264_ptd.display_poc_syntax,
-        task->h264_ptd.temporal_layer, task->h264_ptd.encode_pic_flags,
-        task->h264_ptd.ltr_mark_frame ? 1 : 0, task->h264_ptd.ltr_mark_frame_idx,
-        task->h264_ptd.ltr_use_frames ? 1 : 0, task->h264_ptd.ltr_use_frame_bitmap);
+        task->h264_ptd.valid ? 1 : 0,
+        gst_nv_h264_ptd_owner_to_string (task->h264_ptd.owner),
+        task->h264_ptd.abs_frame_idx_before,
+        task->h264_ptd.gop_frame_idx_before,
+        (gint) task->h264_ptd.picture_type, task->h264_ptd.ref_pic_flag,
+        task->h264_ptd.display_poc_syntax, task->h264_ptd.temporal_layer,
+        task->h264_ptd.encode_pic_flags,
+        task->h264_ptd.ltr_mark_frame ? 1 : 0,
+        task->h264_ptd.ltr_mark_frame_idx,
+        task->h264_ptd.ltr_use_frames ? 1 : 0,
+        task->h264_ptd.ltr_use_frame_bitmap);
     return status;
   }
 

@@ -101,6 +101,30 @@ gst_clear_nv_encoder_resource (GstNvEncResource ** resource)
 #define GST_TYPE_NV_ENC_TASK (gst_nv_enc_task_get_type ())
 struct GstNvEncTask;
 
+typedef enum _GstNvH264PtdOwner
+{
+  GST_NV_H264_PTD_OWNER_UNSET,
+  GST_NV_H264_PTD_OWNER_NVENC_OWNED,
+  GST_NV_H264_PTD_OWNER_PIPELINE_CALCULATED,
+  GST_NV_H264_PTD_OWNER_UPSTREAM_PROVIDED,
+} GstNvH264PtdOwner;
+
+static inline const gchar *
+gst_nv_h264_ptd_owner_to_string (GstNvH264PtdOwner owner)
+{
+  switch (owner) {
+    case GST_NV_H264_PTD_OWNER_NVENC_OWNED:
+      return "nvenc-owned";
+    case GST_NV_H264_PTD_OWNER_PIPELINE_CALCULATED:
+      return "pipeline-calculated";
+    case GST_NV_H264_PTD_OWNER_UPSTREAM_PROVIDED:
+      return "upstream-provided";
+    case GST_NV_H264_PTD_OWNER_UNSET:
+    default:
+      return "unset";
+  }
+}
+
 typedef struct _GstNvEncH264PtdDecision
 {
   gboolean valid;
@@ -113,6 +137,16 @@ typedef struct _GstNvEncH264PtdDecision
   gboolean ltr_use_frames;
   guint32 ltr_mark_frame_idx;
   guint32 ltr_use_frame_bitmap;
+  GstNvH264PtdOwner owner;
+  gboolean is_idr;
+  gboolean gop_boundary;
+  guint64 abs_frame_idx_before;
+  guint64 gop_frame_idx_before;
+  guint64 abs_frame_idx_after;
+  guint64 gop_frame_idx_after;
+  guint32 pattern_idx;
+  guint32 temporal_layers;
+  gboolean temporal_svc_enabled;
 } GstNvEncH264PtdDecision;
 
 GType gst_nv_enc_task_get_type (void);

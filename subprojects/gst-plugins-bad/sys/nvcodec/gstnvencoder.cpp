@@ -37,6 +37,7 @@
 #include <memory>
 #include <atomic>
 #include "gstnvencobject.h"
+#include "gstnvh264ptd.h"
 
 #ifdef HAVE_GST_D3D12
 #include "gstcudainterop_d3d12.h"
@@ -143,10 +144,7 @@ struct _GstNvEncoderPrivate
   gboolean preserve_input_pts = DEFAULT_PRESERVE_INPUT_PTS;
   gchar *config_json = nullptr;
 
-  /* PTD-disabled H.264 decision state */
-  guint64 ptd_abs_frame_idx = 0;
-  guint64 ptd_gop_frame_idx = 0;
-  gboolean ptd_warned_layer_fallback = FALSE;
+  std::unique_ptr < GstNvH264PtdController > h264_ptd_controller;
 };
 
 /**
@@ -225,11 +223,21 @@ gst_nv_encoder_build_nvenc_error_details (const gchar * api,
       "duration", G_TYPE_INT64, (gint64) duration,
       "durationValid", G_TYPE_BOOLEAN, GST_CLOCK_TIME_IS_VALID (duration),
       "h264PtdValid", G_TYPE_BOOLEAN, h264_ptd_valid,
+      "ptdOwner", G_TYPE_STRING, gst_nv_h264_ptd_owner_to_string (ptd->owner),
       "pictureType", G_TYPE_INT, (gint) ptd->picture_type,
       "refPicFlag", G_TYPE_UINT, ptd->ref_pic_flag,
       "poc", G_TYPE_UINT, ptd->display_poc_syntax,
       "temporalLayer", G_TYPE_UINT, ptd->temporal_layer,
       "encodePicFlags", G_TYPE_UINT, ptd->encode_pic_flags,
+      "isIdr", G_TYPE_BOOLEAN, ptd->is_idr,
+      "gopBoundary", G_TYPE_BOOLEAN, ptd->gop_boundary,
+      "absFrameIdxBefore", G_TYPE_UINT64, ptd->abs_frame_idx_before,
+      "gopFrameIdxBefore", G_TYPE_UINT64, ptd->gop_frame_idx_before,
+      "absFrameIdxAfter", G_TYPE_UINT64, ptd->abs_frame_idx_after,
+      "gopFrameIdxAfter", G_TYPE_UINT64, ptd->gop_frame_idx_after,
+      "patternIdx", G_TYPE_UINT, ptd->pattern_idx,
+      "temporalLayers", G_TYPE_UINT, ptd->temporal_layers,
+      "temporalSvcEnabled", G_TYPE_BOOLEAN, ptd->temporal_svc_enabled,
       "ltrMarkFrame", G_TYPE_BOOLEAN, ptd->ltr_mark_frame,
       "ltrMarkFrameIdx", G_TYPE_UINT, ptd->ltr_mark_frame_idx,
       "ltrUseFrames", G_TYPE_BOOLEAN, ptd->ltr_use_frames,
@@ -257,11 +265,12 @@ gst_nv_encoder_post_nvenc_error (GstNvEncoder * self, const gchar * api,
           status_name ? status_name : "unknown"),
       g_strdup_printf ("%s failed status=%d frame=%u pts=%" G_GINT64_FORMAT
           " duration=%" G_GINT64_FORMAT
-          " h264_ptd_valid=%d type=%d ref=%u poc=%u tl=%u flags=0x%x"
+          " h264_ptd_valid=%d owner=%s type=%d ref=%u poc=%u tl=%u flags=0x%x"
           " ltr_mark=%d ltr_idx=%u ltr_use=%d ltr_bitmap=0x%x",
           api ? api : "NVENC operation", (gint) status,
           frame ? frame->system_frame_number : 0, (gint64) pts,
           (gint64) duration, h264_ptd_valid ? 1 : 0,
+          gst_nv_h264_ptd_owner_to_string (ptd->owner),
           (gint) ptd->picture_type, ptd->ref_pic_flag,
           ptd->display_poc_syntax, ptd->temporal_layer,
           ptd->encode_pic_flags, ptd->ltr_mark_frame ? 1 : 0,
@@ -270,6 +279,69 @@ gst_nv_encoder_post_nvenc_error (GstNvEncoder * self, const gchar * api,
       file, function, line,
       gst_nv_encoder_build_nvenc_error_details (api, status, frame, ptd,
           h264_ptd_valid));
+}
+
+static GstStructure *
+gst_nv_encoder_build_h264_ptd_error_details (GstVideoCodecFrame * frame,
+    const GstNvH264PtdResult * result)
+{
+  const GstNvEncH264PtdDecision fallback_decision =
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
+  const GstNvEncH264PtdDecision *ptd =
+      result ? &result->decision : &fallback_decision;
+  GstClockTime pts = frame ? frame->pts : GST_CLOCK_TIME_NONE;
+  GstClockTime duration = frame ? frame->duration : GST_CLOCK_TIME_NONE;
+
+  return gst_structure_new ("ludeocast-h264-ptd-error-details",
+      "component", G_TYPE_STRING, "nvenc",
+      "api", G_TYPE_STRING, "H264PTD",
+      "errorCode", G_TYPE_INT, result ? (gint) result->error_code :
+      (gint) GstNvH264PtdErrorCode::MissingDecision,
+      "errorMessage", G_TYPE_STRING, result && result->error_message ?
+      result->error_message : "missing H.264 picture type decision",
+      "frameNumber", G_TYPE_UINT, frame ? frame->system_frame_number : 0,
+      "pts", G_TYPE_INT64, (gint64) pts,
+      "ptsValid", G_TYPE_BOOLEAN, GST_CLOCK_TIME_IS_VALID (pts),
+      "duration", G_TYPE_INT64, (gint64) duration,
+      "durationValid", G_TYPE_BOOLEAN, GST_CLOCK_TIME_IS_VALID (duration),
+      "h264PtdValid", G_TYPE_BOOLEAN, ptd->valid,
+      "ptdOwner", G_TYPE_STRING, gst_nv_h264_ptd_owner_to_string (ptd->owner),
+      "pictureType", G_TYPE_INT, (gint) ptd->picture_type,
+      "refPicFlag", G_TYPE_UINT, ptd->ref_pic_flag,
+      "poc", G_TYPE_UINT, ptd->display_poc_syntax,
+      "temporalLayer", G_TYPE_UINT, ptd->temporal_layer,
+      "encodePicFlags", G_TYPE_UINT, ptd->encode_pic_flags,
+      "isIdr", G_TYPE_BOOLEAN, ptd->is_idr,
+      "gopBoundary", G_TYPE_BOOLEAN, ptd->gop_boundary,
+      "absFrameIdxBefore", G_TYPE_UINT64, ptd->abs_frame_idx_before,
+      "gopFrameIdxBefore", G_TYPE_UINT64, ptd->gop_frame_idx_before,
+      "absFrameIdxAfter", G_TYPE_UINT64, ptd->abs_frame_idx_after,
+      "gopFrameIdxAfter", G_TYPE_UINT64, ptd->gop_frame_idx_after,
+      "patternIdx", G_TYPE_UINT, ptd->pattern_idx,
+      "temporalLayers", G_TYPE_UINT, ptd->temporal_layers,
+      "temporalSvcEnabled", G_TYPE_BOOLEAN, ptd->temporal_svc_enabled,
+      "ltrMarkFrame", G_TYPE_BOOLEAN, ptd->ltr_mark_frame,
+      "ltrMarkFrameIdx", G_TYPE_UINT, ptd->ltr_mark_frame_idx,
+      "ltrUseFrames", G_TYPE_BOOLEAN, ptd->ltr_use_frames,
+      "ltrUseFrameBitmap", G_TYPE_UINT, ptd->ltr_use_frame_bitmap,
+      nullptr);
+}
+
+static void
+gst_nv_encoder_post_h264_ptd_error (GstNvEncoder * self,
+    GstVideoCodecFrame * frame, const GstNvH264PtdResult * result,
+    const gchar * file, const gchar * function, gint line)
+{
+  const gchar *message = result && result->error_message ?
+      result->error_message : "missing H.264 picture type decision";
+
+  gst_element_message_full_with_details (GST_ELEMENT (self),
+      GST_MESSAGE_ERROR, GST_STREAM_ERROR, GST_STREAM_ERROR_ENCODE,
+      g_strdup_printf ("NVENC H.264 PTD failed: %s", message),
+      g_strdup_printf ("H.264 PTD failed frame=%u error=%s",
+          frame ? frame->system_frame_number : 0, message),
+      file, function, line,
+      gst_nv_encoder_build_h264_ptd_error_details (frame, result));
 }
 
 /* ---- GUID-to-string helper for JSON serialisation ---- */
@@ -982,6 +1054,7 @@ gst_nv_encoder_stop (GstVideoEncoder * encoder)
   }
 
   g_clear_pointer (&priv->input_state, gst_video_codec_state_unref);
+  priv->h264_ptd_controller.reset ();
 
   return TRUE;
 }
@@ -1600,9 +1673,8 @@ gst_nv_encoder_init_session (GstNvEncoder * self, GstBuffer * in_buf)
 
   memset (&priv->init_params, 0, sizeof (NV_ENC_INITIALIZE_PARAMS));
   memset (&priv->config, 0, sizeof (NV_ENC_CONFIG));
-  priv->ptd_abs_frame_idx = 0;
-  priv->ptd_gop_frame_idx = 0;
-  priv->ptd_warned_layer_fallback = FALSE;
+  if (priv->h264_ptd_controller)
+    priv->h264_ptd_controller->reset ();
 
   if (priv->selected_device_mode == GST_NV_ENCODER_DEVICE_AUTO_SELECT) {
     GstNvEncoderDeviceData data;
@@ -2645,17 +2717,18 @@ gst_nv_encoder_get_h264_parser_ptd_decision (GstNvEncoder * self,
   decision->temporal_layer = temporal_id;
 
   GST_LOG_OBJECT (self,
-      "Using parser PTD decision frame=%u type=%d ref=%u poc=%d tl=%u",
+      "Read upstream PTD metadata frame=%u type=%d ref=%u poc=%d tl=%u",
       frame->system_frame_number, (gint) decision->picture_type,
       decision->ref_pic_flag, display_poc, decision->temporal_layer);
 
   return TRUE;
 }
 
-static void
-gst_nv_encoder_apply_h264_ltr_meta (GstNvEncoder * self,
-    GstVideoCodecFrame * frame, GstNvEncH264PtdDecision * decision)
+static GstNvH264LtrRequest
+gst_nv_encoder_read_h264_ltr_request (GstNvEncoder * self,
+    GstVideoCodecFrame * frame)
 {
+  GstNvH264LtrRequest request;
   GstCustomMeta *meta;
   GstStructure *s;
   gboolean mark_frame = FALSE;
@@ -2663,159 +2736,114 @@ gst_nv_encoder_apply_h264_ltr_meta (GstNvEncoder * self,
   guint mark_idx = 0;
   guint use_bitmap = 0;
 
-  g_return_if_fail (decision != NULL);
-
   if (frame == NULL || frame->input_buffer == NULL)
-    return;
+    return request;
 
   meta = gst_buffer_get_custom_meta (frame->input_buffer,
       GST_NVENC_LTR_META_NAME);
   if (meta == NULL)
-    return;
+    return request;
 
   s = gst_custom_meta_get_structure (meta);
   if (s == NULL)
-    return;
+    return request;
 
   gst_structure_get_boolean (s, "ltr-mark-frame", &mark_frame);
   gst_structure_get_boolean (s, "ltr-use-frames", &use_frames);
   gst_structure_get_uint (s, "ltr-mark-frame-idx", &mark_idx);
   gst_structure_get_uint (s, "ltr-use-frame-bitmap", &use_bitmap);
 
-  if (decision->picture_type == NV_ENC_PIC_TYPE_IDR) {
-    GST_LOG_OBJECT (self,
-        "Ignoring LTR metadata on IDR frame=%u mark=%d idx=%u use=%d bitmap=0x%x",
-        frame->system_frame_number, mark_frame ? 1 : 0, mark_idx,
-        use_frames ? 1 : 0, use_bitmap);
-    return;
-  }
-
-  if (mark_frame) {
-    decision->ltr_mark_frame = TRUE;
-    decision->ltr_mark_frame_idx = mark_idx;
-  }
-  if (use_frames && use_bitmap != 0) {
-    decision->ltr_use_frames = TRUE;
-    decision->ltr_use_frame_bitmap = use_bitmap;
-  }
+  request.mark_frame = mark_frame;
+  request.use_frames = use_frames;
+  request.mark_frame_idx = mark_idx;
+  request.use_frame_bitmap = use_bitmap;
 
   if (mark_frame || (use_frames && use_bitmap != 0)) {
     GST_LOG_OBJECT (self,
-        "Using LTR metadata frame=%u mark=%d idx=%u use=%d bitmap=0x%x",
+        "Read LTR metadata frame=%u mark=%d idx=%u use=%d bitmap=0x%x",
         frame->system_frame_number, mark_frame ? 1 : 0, mark_idx,
         use_frames ? 1 : 0, use_bitmap);
   }
+
+  return request;
 }
 
-static void
+static gboolean
 gst_nv_encoder_prepare_h264_ptd_decision (GstNvEncoder * self,
     GstVideoCodecFrame * frame, GstNvEncTask * task)
 {
   GstNvEncoderPrivate *priv = self->priv;
-  GstNvEncH264PtdDecision decision =
-      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
   const NV_ENC_CONFIG_H264 *h264;
-  gboolean is_idr;
-  gboolean gop_boundary = FALSE;
-  const gchar *decision_mode = "L1T1";
-  guint temporal_layer = 0;
-  guint ref_pic_flag = 1;
-  guint64 display_poc;
+  GstNvH264PtdConfig config;
+  GstNvH264FrameInput input;
+  GstNvH264LtrRequest ltr;
+  GstNvEncH264PtdDecision upstream_decision =
+      { FALSE, NV_ENC_PIC_TYPE_P, 0, 1, 0, 0, FALSE, FALSE, 0, 0 };
+  GstNvH264PtdResult result;
 
   if (!is_equal_guid (priv->init_params.encodeGUID, NV_ENC_CODEC_H264_GUID))
-    return;
+    return TRUE;
 
-  if (priv->init_params.enablePTD != 0)
-    return;
-
-  if (gst_nv_encoder_get_h264_parser_ptd_decision (self, frame, &decision)) {
-    gst_nv_encoder_apply_h264_ltr_meta (self, frame, &decision);
-    gst_nv_enc_task_set_h264_ptd_decision (task, &decision);
-
-    priv->ptd_abs_frame_idx++;
-    if (decision.picture_type == NV_ENC_PIC_TYPE_IDR)
-      priv->ptd_gop_frame_idx = 1;
-    else
-      priv->ptd_gop_frame_idx++;
-
-    return;
+  if (priv->init_params.enablePTD != 0) {
+    GST_LOG_OBJECT (self, "Skipping H264 PTD preparation, owner=%s",
+        gst_nv_h264_ptd_owner_to_string (
+            GST_NV_H264_PTD_OWNER_NVENC_OWNED));
+    return TRUE;
   }
 
   h264 = &priv->config.encodeCodecConfig.h264Config;
 
-  if (priv->config.gopLength > 0 &&
-      priv->config.gopLength != NVENC_INFINITE_GOPLENGTH &&
-      priv->ptd_gop_frame_idx >= priv->config.gopLength) {
-    gop_boundary = TRUE;
+  config.temporal_layers = MAX ((guint) h264->numTemporalLayers, 1);
+  config.gop_length = priv->config.gopLength;
+  config.enable_temporal_svc = h264->enableTemporalSVC ? TRUE : FALSE;
+  config.repeat_sps_pps = h264->repeatSPSPPS ? TRUE : FALSE;
+  config.use_non_ref_p_type = FALSE;
+  config.strict_validation = TRUE;
+
+  if (!priv->h264_ptd_controller) {
+    priv->h264_ptd_controller.reset (new GstNvH264PtdController (config));
+  } else {
+    priv->h264_ptd_controller->updateConfig (config);
   }
 
-  is_idr = GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame) ||
-      priv->ptd_abs_frame_idx == 0 || gop_boundary;
+  input.system_frame_number = frame ? frame->system_frame_number : 0;
+  input.pts = frame ? frame->pts : GST_CLOCK_TIME_NONE;
+  input.duration = frame ? frame->duration : GST_CLOCK_TIME_NONE;
+  input.force_keyframe = frame && GST_VIDEO_CODEC_FRAME_IS_FORCE_KEYFRAME (frame);
+  ltr = gst_nv_encoder_read_h264_ltr_request (self, frame);
 
-  if (!is_idr && h264->enableTemporalSVC) {
-    if (h264->numTemporalLayers >= 4) {
-      /* These tables mirror driver-owned enablePTD=1 decisions observed by
-       * ltr_svc_probe. Index 0 is the base-layer frame at the start of a
-       * hierarchy period, so after an IDR the first P frame starts at index 1. */
-      static const guint l1t4_tid[] = { 0, 3, 2, 3, 1, 3, 2, 3 };
-      static const guint l1t4_ref[] = { 1, 0, 1, 0, 1, 0, 1, 0 };
-      guint pattern_idx = (guint) (priv->ptd_gop_frame_idx %
-          G_N_ELEMENTS (l1t4_tid));
-
-      temporal_layer = l1t4_tid[pattern_idx];
-      ref_pic_flag = l1t4_ref[pattern_idx];
-      decision_mode = "L1T4";
-    } else if (h264->numTemporalLayers == 3) {
-      static const guint l1t3_tid[] = { 0, 2, 1, 2 };
-      static const guint l1t3_ref[] = { 1, 0, 1, 0 };
-      guint pattern_idx = (guint) (priv->ptd_gop_frame_idx %
-          G_N_ELEMENTS (l1t3_tid));
-
-      temporal_layer = l1t3_tid[pattern_idx];
-      ref_pic_flag = l1t3_ref[pattern_idx];
-      decision_mode = "L1T3";
-    } else if (h264->numTemporalLayers == 2) {
-      static const guint l1t2_tid[] = { 0, 1 };
-      static const guint l1t2_ref[] = { 1, 0 };
-      guint pattern_idx = (guint) (priv->ptd_gop_frame_idx %
-          G_N_ELEMENTS (l1t2_tid));
-
-      temporal_layer = l1t2_tid[pattern_idx];
-      ref_pic_flag = l1t2_ref[pattern_idx];
-      decision_mode = "L1T2";
-    }
+  if (gst_nv_encoder_get_h264_parser_ptd_decision (self, frame,
+          &upstream_decision)) {
+    result = priv->h264_ptd_controller->acceptUpstreamDecision (input,
+        upstream_decision, ltr);
+  } else {
+    result = priv->h264_ptd_controller->decide (input, ltr);
   }
 
-  decision.valid = TRUE;
-  decision.picture_type = is_idr ? NV_ENC_PIC_TYPE_IDR : NV_ENC_PIC_TYPE_P;
-
-  display_poc = MIN (priv->ptd_abs_frame_idx, (guint64) G_MAXUINT32);
-  decision.display_poc_syntax = (guint32) display_poc;
-  decision.ref_pic_flag = is_idr ? 1 : ref_pic_flag;
-  decision.temporal_layer = is_idr ? 0 : temporal_layer;
-
-  if (is_idr) {
-    decision.encode_pic_flags |= NV_ENC_PIC_FLAG_FORCEIDR;
-    if (h264->repeatSPSPPS)
-      decision.encode_pic_flags |= NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+  if (result.error_code != GstNvH264PtdErrorCode::None ||
+      !result.decision.valid) {
+    gst_nv_encoder_post_h264_ptd_error (self, frame, &result, __FILE__,
+        GST_FUNCTION, __LINE__);
+    return FALSE;
   }
 
-  gst_nv_encoder_apply_h264_ltr_meta (self, frame, &decision);
-  gst_nv_enc_task_set_h264_ptd_decision (task, &decision);
+  gst_nv_enc_task_set_h264_ptd_decision (task, &result.decision);
 
   GST_LOG_OBJECT (self,
-      "PTD decision frame=%u abs=%" G_GUINT64_FORMAT " gop=%" G_GUINT64_FORMAT
-      " type=%d ref=%u tl=%u mode=%s flags=0x%x",
-      frame->system_frame_number, priv->ptd_abs_frame_idx,
-      priv->ptd_gop_frame_idx, (gint) decision.picture_type,
-      decision.ref_pic_flag, decision.temporal_layer,
-      decision_mode, decision.encode_pic_flags);
+      "PTD decision frame=%u owner=%s abs=%" G_GUINT64_FORMAT
+      " gop=%" G_GUINT64_FORMAT " type=%d ref=%u poc=%u tl=%u pattern=%u"
+      " flags=0x%x ltr_mark=%d ltr_use=%d",
+      frame->system_frame_number,
+      gst_nv_h264_ptd_owner_to_string (result.decision.owner),
+      result.decision.abs_frame_idx_before,
+      result.decision.gop_frame_idx_before,
+      (gint) result.decision.picture_type, result.decision.ref_pic_flag,
+      result.decision.display_poc_syntax, result.decision.temporal_layer,
+      result.decision.pattern_idx, result.decision.encode_pic_flags,
+      result.decision.ltr_mark_frame ? 1 : 0,
+      result.decision.ltr_use_frames ? 1 : 0);
 
-  priv->ptd_abs_frame_idx++;
-  if (is_idr)
-    priv->ptd_gop_frame_idx = 1;
-  else
-    priv->ptd_gop_frame_idx++;
+  return TRUE;
 }
 
 static GstFlowReturn
@@ -2917,7 +2945,12 @@ gst_nv_encoder_handle_frame (GstVideoEncoder * encoder,
       frame->pts = input_pts;
   }
 
-  gst_nv_encoder_prepare_h264_ptd_decision (self, frame, task);
+  if (!gst_nv_encoder_prepare_h264_ptd_decision (self, frame, task)) {
+    gst_nv_enc_task_unref (task);
+    gst_video_encoder_release_frame (encoder, frame);
+    return GST_FLOW_ERROR;
+  }
+
   GstNvEncH264PtdDecision encode_h264_ptd;
   gboolean encode_h264_ptd_valid =
       gst_nv_encoder_get_task_h264_ptd_decision (task, &encode_h264_ptd);

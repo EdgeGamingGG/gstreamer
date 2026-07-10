@@ -28,6 +28,7 @@ nvcodec_dgpu_sources = [
   'gstnvenc.c',
   'gstnvencobject.cpp',
   'gstnvencoder.cpp',
+  'gstnvh264ptd.cpp',
   'gstnvh264dec.cpp',
   'gstnvh264encoder.cpp',
   'gstnvh265dec.cpp',
