@@ -364,7 +364,8 @@ gst_nv_encoder_ensure_h264_ptd_decision_meta_registered ()
 
 static void
 gst_nv_encoder_attach_h264_ptd_decision_meta (GstBuffer * buffer,
-    const GstNvEncH264PtdDecision * decision)
+    const GstNvEncH264PtdDecision * decision,
+    const NV_ENC_LOCK_BITSTREAM * bitstream)
 {
   GstCustomMeta *meta;
   GstStructure *structure;
@@ -404,6 +405,22 @@ gst_nv_encoder_attach_h264_ptd_decision_meta (GstBuffer * buffer,
       "ltr-use-frames", G_TYPE_BOOLEAN, decision->ltr_use_frames,
       "ltr-use-frame-bitmap", G_TYPE_UINT, decision->ltr_use_frame_bitmap,
       nullptr);
+
+  if (bitstream != nullptr) {
+    gst_structure_set (structure,
+        "has-nvenc-output", G_TYPE_BOOLEAN, TRUE,
+        "nvenc-output-picture-type", G_TYPE_UINT,
+        (guint) bitstream->pictureType,
+        "nvenc-output-temporal-id", G_TYPE_UINT,
+        (guint) bitstream->temporalId,
+        "nvenc-output-ltr-frame", G_TYPE_BOOLEAN,
+        bitstream->ltrFrame ? TRUE : FALSE,
+        "nvenc-output-ltr-frame-idx", G_TYPE_UINT,
+        (guint) bitstream->ltrFrameIdx,
+        "nvenc-output-ltr-frame-bitmap", G_TYPE_UINT,
+        (guint) bitstream->ltrFrameBitmap,
+        nullptr);
+  }
 }
 
 /* ---- GUID-to-string helper for JSON serialisation ---- */
@@ -1538,7 +1555,7 @@ gst_nv_encoder_thread_func (GstNvEncoder * self)
           bitstream.bitstreamSizeInBytes);
     }
     gst_nv_encoder_attach_h264_ptd_decision_meta (frame->output_buffer,
-        h264_ptd_valid ? &h264_ptd : nullptr);
+        h264_ptd_valid ? &h264_ptd : nullptr, &bitstream);
 
     GST_BUFFER_FLAG_SET (frame->output_buffer, GST_BUFFER_FLAG_MARKER);
 
