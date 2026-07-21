@@ -5385,7 +5385,7 @@ _connect_input_stream (GstWebRTCBin * webrtc, GstWebRTCBinPad * pad)
   srcpad = gst_element_get_static_pad (clocksync, "src");
 
   fec_encoder = NULL;
-  if (trans->fec_type != GST_WEBRTC_FEC_TYPE_NONE) {
+  if (trans->fec_type != GST_WEBRTC_FEC_TYPE_NONE && !trans->fec_bin) {
     fec_encoder = _build_fec_encoder (webrtc, trans);
     if (!fec_encoder) {
       g_warn_if_reached ();
@@ -5435,6 +5435,26 @@ _connect_input_stream (GstWebRTCBin * webrtc, GstWebRTCBinPad * pad)
     gst_object_unref (funnel_sinkpad);
 
     if (trans->stream->rtpbin_sendbin_deferred_session_id >= 0) {
+      GstWebRTCRTPTransceiver *deferred_rtp_trans =
+          _find_transceiver_for_mline (webrtc,
+          (guint) trans->stream->rtpbin_sendbin_deferred_session_id);
+      WebRTCTransceiver *deferred_trans =
+          deferred_rtp_trans ? WEBRTC_TRANSCEIVER (deferred_rtp_trans) : NULL;
+
+      if (deferred_trans
+          && deferred_trans->fec_type != GST_WEBRTC_FEC_TYPE_NONE
+          && !deferred_trans->fec_bin) {
+        GstElement *deferred_fec_encoder;
+
+        deferred_fec_encoder = _build_fec_encoder (webrtc, deferred_trans);
+        if (deferred_fec_encoder) {
+          gst_bin_add (GST_BIN (webrtc), deferred_fec_encoder);
+          gst_element_sync_state_with_parent (deferred_fec_encoder);
+          _set_internal_rtpbin_element_props_from_stream (webrtc,
+              trans->stream);
+        }
+      }
+
       connect_rtpbin_with_sendbin (webrtc,
           (guint) trans->stream->rtpbin_sendbin_deferred_session_id,
           trans->stream);
