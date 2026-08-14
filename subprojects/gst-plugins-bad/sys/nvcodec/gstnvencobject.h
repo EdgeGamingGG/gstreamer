@@ -137,6 +137,10 @@ typedef struct _GstNvEncH264PtdDecision
   gboolean ltr_use_frames;
   guint32 ltr_mark_frame_idx;
   guint32 ltr_use_frame_bitmap;
+  gboolean ltr_reset;
+  guint32 ltr_slot_count;
+  guint32 ltr_confirmed_bitmap;
+  gint32 ltr_mark_candidate;
   GstNvH264PtdOwner owner;
   gboolean is_idr;
   gboolean gop_boundary;

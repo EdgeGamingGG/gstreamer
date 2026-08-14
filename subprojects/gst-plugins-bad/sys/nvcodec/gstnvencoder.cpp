@@ -243,6 +243,10 @@ gst_nv_encoder_build_nvenc_error_details (const gchar * api,
       "ltrMarkFrameIdx", G_TYPE_UINT, ptd->ltr_mark_frame_idx,
       "ltrUseFrames", G_TYPE_BOOLEAN, ptd->ltr_use_frames,
       "ltrUseFrameBitmap", G_TYPE_UINT, ptd->ltr_use_frame_bitmap,
+      "ltrReset", G_TYPE_BOOLEAN, ptd->ltr_reset,
+      "ltrSlotCount", G_TYPE_UINT, ptd->ltr_slot_count,
+      "ltrConfirmedBitmap", G_TYPE_UINT, ptd->ltr_confirmed_bitmap,
+      "ltrMarkCandidate", G_TYPE_INT, ptd->ltr_mark_candidate,
       nullptr);
 }
 
@@ -325,6 +329,10 @@ gst_nv_encoder_build_h264_ptd_error_details (GstVideoCodecFrame * frame,
       "ltrMarkFrameIdx", G_TYPE_UINT, ptd->ltr_mark_frame_idx,
       "ltrUseFrames", G_TYPE_BOOLEAN, ptd->ltr_use_frames,
       "ltrUseFrameBitmap", G_TYPE_UINT, ptd->ltr_use_frame_bitmap,
+      "ltrReset", G_TYPE_BOOLEAN, ptd->ltr_reset,
+      "ltrSlotCount", G_TYPE_UINT, ptd->ltr_slot_count,
+      "ltrConfirmedBitmap", G_TYPE_UINT, ptd->ltr_confirmed_bitmap,
+      "ltrMarkCandidate", G_TYPE_INT, ptd->ltr_mark_candidate,
       nullptr);
 }
 
@@ -404,6 +412,10 @@ gst_nv_encoder_attach_h264_ptd_decision_meta (GstBuffer * buffer,
       "ltr-mark-frame-idx", G_TYPE_UINT, decision->ltr_mark_frame_idx,
       "ltr-use-frames", G_TYPE_BOOLEAN, decision->ltr_use_frames,
       "ltr-use-frame-bitmap", G_TYPE_UINT, decision->ltr_use_frame_bitmap,
+      "ltr-reset", G_TYPE_BOOLEAN, decision->ltr_reset,
+      "ltr-slot-count", G_TYPE_UINT, decision->ltr_slot_count,
+      "ltr-confirmed-bitmap", G_TYPE_UINT, decision->ltr_confirmed_bitmap,
+      "ltr-mark-candidate", G_TYPE_INT, decision->ltr_mark_candidate,
       nullptr);
 
   if (bitstream != nullptr) {
@@ -2813,10 +2825,9 @@ gst_nv_encoder_read_h264_ltr_request (GstNvEncoder * self,
   GstNvH264LtrRequest request;
   GstCustomMeta *meta;
   GstStructure *s;
-  gboolean mark_frame = FALSE;
-  gboolean use_frames = FALSE;
-  guint mark_idx = 0;
-  guint use_bitmap = 0;
+  guint slot_count = 0;
+  guint confirmed_bitmap = 0;
+  gint mark_candidate = -1;
 
   if (frame == NULL || frame->input_buffer == NULL)
     return request;
@@ -2830,21 +2841,19 @@ gst_nv_encoder_read_h264_ltr_request (GstNvEncoder * self,
   if (s == NULL)
     return request;
 
-  gst_structure_get_boolean (s, "ltr-mark-frame", &mark_frame);
-  gst_structure_get_boolean (s, "ltr-use-frames", &use_frames);
-  gst_structure_get_uint (s, "ltr-mark-frame-idx", &mark_idx);
-  gst_structure_get_uint (s, "ltr-use-frame-bitmap", &use_bitmap);
+  gst_structure_get_uint (s, "ltr-slot-count", &slot_count);
+  gst_structure_get_uint (s, "ltr-confirmed-bitmap", &confirmed_bitmap);
+  gst_structure_get_int (s, "ltr-mark-candidate", &mark_candidate);
 
-  request.mark_frame = mark_frame;
-  request.use_frames = use_frames;
-  request.mark_frame_idx = mark_idx;
-  request.use_frame_bitmap = use_bitmap;
+  request.slot_count = slot_count;
+  request.confirmed_bitmap = confirmed_bitmap;
+  request.mark_candidate = mark_candidate;
 
-  if (mark_frame || (use_frames && use_bitmap != 0)) {
+  if (slot_count > 0) {
     GST_LOG_OBJECT (self,
-        "Read LTR metadata frame=%u mark=%d idx=%u use=%d bitmap=0x%x",
-        frame->system_frame_number, mark_frame ? 1 : 0, mark_idx,
-        use_frames ? 1 : 0, use_bitmap);
+        "Read LTR policy frame=%u slots=%u confirmed=0x%x candidate=%d",
+        frame->system_frame_number, slot_count, confirmed_bitmap,
+        mark_candidate);
   }
 
   return request;

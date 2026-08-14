@@ -70,6 +70,7 @@ GstNvH264PtdController::reset ()
 {
   abs_frame_idx_ = 0;
   gop_frame_idx_ = 0;
+  ltr_live_bitmap_ = 0;
 }
 
 void
@@ -123,6 +124,7 @@ GstNvH264PtdController::acceptUpstreamDecision (
     return result;
   }
 
+  commitLtrDecision (result.decision);
   advance (&result.decision);
   result.error_message = errorMessage (GstNvH264PtdErrorCode::None);
 
@@ -206,6 +208,7 @@ GstNvH264PtdController::decidePipelineCalculated (
     return result;
   }
 
+  commitLtrDecision (*decision);
   advance (decision);
   result.error_message = errorMessage (GstNvH264PtdErrorCode::None);
 
@@ -269,19 +272,58 @@ GstNvH264PtdController::applyLtr (GstNvEncH264PtdDecision * decision,
   decision->ltr_use_frames = FALSE;
   decision->ltr_mark_frame_idx = 0;
   decision->ltr_use_frame_bitmap = 0;
+  decision->ltr_reset = decision->is_idr;
+  decision->ltr_slot_count = ltr.slot_count;
+  decision->ltr_confirmed_bitmap = ltr.confirmed_bitmap;
+  decision->ltr_mark_candidate = ltr.mark_candidate;
 
-  if (decision->picture_type == NV_ENC_PIC_TYPE_IDR)
+  if (decision->is_idr || decision->picture_type == NV_ENC_PIC_TYPE_IDR)
     return;
 
-  if (ltr.mark_frame) {
+  if (decision->ref_pic_flag == 0 || ltr.slot_count == 0)
+    return;
+
+  guint slot_count = MIN (ltr.slot_count, 32);
+  guint32 slot_mask = slot_count >= 32 ? G_MAXUINT32 :
+      ((1u << slot_count) - 1u);
+  gboolean markable = !decision->temporal_svc_enabled ||
+      decision->temporal_layer == 0;
+
+  if (!markable)
+    return;
+
+  guint32 use_bitmap = ltr.confirmed_bitmap & ltr_live_bitmap_ & slot_mask;
+
+  if (ltr.mark_candidate >= 0 &&
+      (guint) ltr.mark_candidate < slot_count) {
     decision->ltr_mark_frame = TRUE;
-    decision->ltr_mark_frame_idx = ltr.mark_frame_idx;
+    decision->ltr_mark_frame_idx = (guint32) ltr.mark_candidate;
+    use_bitmap &= ~(1u << decision->ltr_mark_frame_idx);
   }
 
-  if (ltr.use_frames && ltr.use_frame_bitmap != 0) {
+  if (use_bitmap != 0) {
     decision->ltr_use_frames = TRUE;
-    decision->ltr_use_frame_bitmap = ltr.use_frame_bitmap;
+    decision->ltr_use_frame_bitmap = use_bitmap;
   }
+}
+
+void
+GstNvH264PtdController::commitLtrDecision (
+    const GstNvEncH264PtdDecision & decision)
+{
+  guint slot_count = MIN (decision.ltr_slot_count, 32);
+  guint32 slot_mask = slot_count >= 32 ? G_MAXUINT32 :
+      (slot_count == 0 ? 0 : ((1u << slot_count) - 1u));
+
+  ltr_live_bitmap_ &= slot_mask;
+
+  if (decision.ltr_reset) {
+    ltr_live_bitmap_ = 0;
+    return;
+  }
+
+  if (decision.ltr_mark_frame && decision.ltr_mark_frame_idx < slot_count)
+    ltr_live_bitmap_ |= (1u << decision.ltr_mark_frame_idx);
 }
 
 const gchar *

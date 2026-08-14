@@ -42,10 +42,9 @@ struct GstNvH264FrameInput
 
 struct GstNvH264LtrRequest
 {
-  gboolean mark_frame = FALSE;
-  gboolean use_frames = FALSE;
-  guint mark_frame_idx = 0;
-  guint use_frame_bitmap = 0;
+  guint slot_count = 0;
+  guint confirmed_bitmap = 0;
+  gint mark_candidate = -1;
 };
 
 struct GstNvH264PtdCounters
@@ -85,9 +84,11 @@ private:
   void advance (GstNvEncH264PtdDecision * decision);
   void applyLtr (GstNvEncH264PtdDecision * decision,
       const GstNvH264LtrRequest & ltr) const;
+  void commitLtrDecision (const GstNvEncH264PtdDecision & decision);
   const gchar *errorMessage (GstNvH264PtdErrorCode error_code) const;
 
   GstNvH264PtdConfig config_;
   guint64 abs_frame_idx_ = 0;
   guint64 gop_frame_idx_ = 0;
+  guint32 ltr_live_bitmap_ = 0;
 };
