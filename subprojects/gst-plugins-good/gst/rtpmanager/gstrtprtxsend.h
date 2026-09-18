@@ -32,6 +32,7 @@ G_BEGIN_DECLS
 
 typedef struct _GstRtpRtxSend GstRtpRtxSend;
 typedef struct _GstRtpRtxSendClass GstRtpRtxSendClass;
+typedef struct _GstRtpRtxBudget GstRtpRtxBudget;
 
 #define GST_TYPE_RTP_RTX_SEND (gst_rtp_rtx_send_get_type())
 #define GST_RTP_RTX_SEND(obj) (G_TYPE_CHECK_INSTANCE_CAST((obj),GST_TYPE_RTP_RTX_SEND, GstRtpRtxSend))
@@ -51,6 +52,8 @@ struct _GstRtpRtxSend
 
   /* rtp packets that will be pushed out */
   GstDataQueue *queue;
+  /* Optional repair-only policy; protected by the element object lock. */
+  GstRtpRtxBudget *budget;
 
   /* ssrc -> SSRCRtxData */
   GHashTable *ssrc_data;

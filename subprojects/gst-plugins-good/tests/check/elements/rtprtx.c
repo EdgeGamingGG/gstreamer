@@ -1162,6 +1162,292 @@ GST_START_TEST (test_rtxsend_header_extensions)
 
 GST_END_TEST;
 
+
+/* Budget vectors use a test clock; OS scheduling never grants rate credit. */
+static GstHarness *
+budget_harness (guint64 burst, guint64 cap, guint queue_ms)
+{
+  GstElement *element = gst_element_factory_make ("rtprtxsend", NULL);
+  GstStructure *map = create_rtx_map ("application/x-rtp-pt-map", 96, 106);
+  GstHarness *h;
+  g_object_set (element, "rtx-budget-enabled", TRUE,
+      "rtx-budget-bps", (guint64) 344,
+      "rtx-budget-burst-bytes", burst,
+      "rtx-budget-max-queue-bytes", cap,
+      "rtx-budget-max-queue-time", queue_ms,
+      "payload-type-map", map, NULL);
+  gst_structure_free (map);
+  h = gst_harness_new_with_element (element, "sink", "src");
+  gst_harness_use_testclock (h);
+  gst_harness_set_time (h, 0);
+  gst_harness_set_src_caps_str (h, "application/x-rtp,clock-rate=(int)90000");
+  return h;
+}
+
+static guint64
+budget_stat (GstHarness * h, const gchar * name)
+{
+  GstStructure *stats = NULL;
+  guint64 value;
+  g_object_get (h->element, "rtx-budget-stats", &stats, NULL);
+  fail_unless (stats != NULL);
+  fail_unless (gst_structure_get_uint64 (stats, name, &value));
+  gst_structure_free (stats);
+  return value;
+}
+
+static void
+budget_wait_stat (GstHarness * h, const gchar * name, guint64 expected)
+{
+  gint64 end = g_get_monotonic_time () + G_TIME_SPAN_SECOND * 3;
+  while (budget_stat (h, name) != expected && g_get_monotonic_time () < end)
+    g_usleep (100);
+  fail_unless_equals_uint64 (budget_stat (h, name), expected);
+}
+
+static void
+budget_original (GstHarness * h, guint16 seq)
+{
+  fail_unless_equals_int (gst_harness_push (h, create_rtp_buffer (123, 96, seq)),
+      GST_FLOW_OK);
+  gst_buffer_unref (gst_harness_pull (h));
+}
+
+static void
+budget_request (GstHarness * h, guint16 seq)
+{
+  fail_unless (gst_harness_push_upstream_event (h, create_rtx_event (123, 96, seq)));
+}
+
+GST_START_TEST (test_rtx_budget_fifo_cap_coalescing)
+{
+  GstHarness *h = budget_harness (43, 86, 2000);
+  GstBuffer *buffer;
+  guint i;
+  for (i = 0; i < 4; i++)
+    budget_original (h, i);
+  budget_request (h, 0);
+  buffer = gst_harness_pull (h);
+  fail_unless_equals_uint64 (gst_buffer_get_size (buffer), 43);
+  gst_buffer_unref (buffer);
+  budget_wait_stat (h, "queue-bytes", 0);
+  budget_request (h, 1);
+  fail_unless (gst_harness_wait_for_clock_id_waits (h, 1, 3));
+  budget_request (h, 2);
+  budget_request (h, 3);
+  budget_request (h, 1);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 86);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-full"), 1);
+  fail_unless_equals_uint64 (budget_stat (h, "coalesced"), 1);
+  /* An original can still pass while the RTX task waits for credit. */
+  budget_original (h, 4);
+  fail_unless (gst_harness_crank_single_clock_wait (h));
+  gst_buffer_unref (gst_harness_pull (h));
+  fail_unless (gst_harness_crank_single_clock_wait (h));
+  gst_buffer_unref (gst_harness_pull (h));
+  budget_wait_stat (h, "queue-bytes", 0);
+  fail_unless_equals_uint64 (budget_stat (h, "handoff-attempt-bytes"), 129);
+  fail_unless_equals_uint64 (budget_stat (h, "expired"), 0);
+  /* Rejected repairs did not remove their originals from history. */
+  budget_request (h, 3);
+  fail_unless (gst_harness_crank_single_clock_wait (h));
+  gst_buffer_unref (gst_harness_pull (h));
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_rtx_budget_expiry_and_flush)
+{
+  GstHarness *h = budget_harness (43, 86, 500);
+  budget_original (h, 65535);
+  budget_original (h, 0);
+  budget_request (h, 65535);
+  gst_buffer_unref (gst_harness_pull (h));
+  budget_wait_stat (h, "queue-bytes", 0);
+  budget_request (h, 0);
+  fail_unless (gst_harness_crank_single_clock_wait (h));
+  budget_wait_stat (h, "expired", 1);
+  fail_unless_equals_int (gst_harness_buffers_in_queue (h), 0);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 0);
+  budget_request (h, 0);
+  fail_unless (gst_harness_wait_for_clock_id_waits (h, 1, 3));
+  fail_unless (gst_harness_push_event (h, gst_event_new_flush_start ()));
+  fail_unless_equals_uint64 (budget_stat (h, "cancelled"), 1);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 0);
+  fail_unless (gst_harness_push_event (h, gst_event_new_flush_stop (TRUE)));
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_rtx_budget_zero_wait_and_oversize)
+{
+  GstHarness *h = budget_harness (43, 86, 0);
+  budget_original (h, 0);
+  budget_original (h, 1);
+  budget_request (h, 0);
+  gst_buffer_unref (gst_harness_pull (h));
+  budget_request (h, 1);
+  budget_wait_stat (h, "expired", 1);
+  fail_unless_equals_uint64 (budget_stat (h, "handoff-attempt-bytes"), 43);
+  gst_harness_teardown (h);
+
+  h = budget_harness (42, 86, 1000);
+  budget_original (h, 0);
+  budget_request (h, 0);
+  fail_unless_equals_uint64 (budget_stat (h, "packet-exceeds-burst"), 1);
+  fail_unless_equals_uint64 (budget_stat (h, "handoff-attempts"), 0);
+  gst_harness_teardown (h);
+
+  h = budget_harness (43, 42, 1000);
+  budget_original (h, 0);
+  budget_request (h, 0);
+  budget_request (h, 12);
+  fail_unless_equals_uint64 (budget_stat (h, "packet-exceeds-queue-cap"), 1);
+  fail_unless_equals_uint64 (budget_stat (h, "cache-misses"), 1);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+
+typedef struct
+{
+  GMutex mutex;
+  GCond cond;
+  gboolean entered, release;
+} BudgetPushBarrier;
+
+static GstPadProbeReturn
+budget_block_push (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  BudgetPushBarrier *barrier = user_data;
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER (info);
+  if (!GST_BUFFER_FLAG_IS_SET (buffer, GST_RTP_BUFFER_FLAG_RETRANSMISSION))
+    return GST_PAD_PROBE_OK;
+  g_mutex_lock (&barrier->mutex);
+  barrier->entered = TRUE;
+  g_cond_broadcast (&barrier->cond);
+  while (!barrier->release)
+    g_cond_wait (&barrier->cond, &barrier->mutex);
+  g_mutex_unlock (&barrier->mutex);
+  return GST_PAD_PROBE_OK;
+}
+
+GST_START_TEST (test_rtx_budget_in_progress_reservation)
+{
+  GstHarness *h = budget_harness (43, 86, 1000);
+  BudgetPushBarrier barrier = { 0, };
+  gulong probe;
+  g_mutex_init (&barrier.mutex);
+  g_cond_init (&barrier.cond);
+  budget_original (h, 0);
+  budget_original (h, 1);
+  budget_original (h, 2);
+  probe = gst_pad_add_probe (h->sinkpad, GST_PAD_PROBE_TYPE_BUFFER,
+      budget_block_push, &barrier, NULL);
+  budget_request (h, 0);
+  g_mutex_lock (&barrier.mutex);
+  while (!barrier.entered)
+    g_cond_wait (&barrier.cond, &barrier.mutex);
+  g_mutex_unlock (&barrier.mutex);
+  budget_request (h, 0);
+  budget_request (h, 1);
+  budget_request (h, 2);
+  fail_unless_equals_uint64 (budget_stat (h, "worker-bytes"), 43);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 86);
+  fail_unless_equals_uint64 (budget_stat (h, "coalesced"), 1);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-full"), 1);
+  gst_harness_set_time (h, GST_SECOND + 1);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 43);
+  fail_unless_equals_uint64 (budget_stat (h, "expired"), 1);
+  g_mutex_lock (&barrier.mutex);
+  barrier.release = TRUE;
+  g_cond_broadcast (&barrier.cond);
+  g_mutex_unlock (&barrier.mutex);
+  gst_buffer_unref (gst_harness_pull (h));
+  budget_wait_stat (h, "queue-bytes", 0);
+  gst_pad_remove_probe (h->sinkpad, probe);
+  gst_harness_teardown (h);
+  g_cond_clear (&barrier.cond);
+  g_mutex_clear (&barrier.mutex);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_rtx_budget_duplicate_deadline_and_eos)
+{
+  GstHarness *h = budget_harness (43, 86, 1500);
+  budget_original (h, 0);
+  budget_original (h, 1);
+  budget_original (h, 2);
+  budget_request (h, 0);
+  gst_buffer_unref (gst_harness_pull (h));
+  budget_wait_stat (h, "queue-bytes", 0);
+  budget_request (h, 1);
+  budget_request (h, 2);
+  gst_harness_set_time (h, GST_SECOND / 2);
+  budget_request (h, 2);
+  fail_unless (gst_harness_crank_single_clock_wait (h));
+  gst_buffer_unref (gst_harness_pull (h));
+  fail_unless (gst_harness_crank_single_clock_wait (h));
+  budget_wait_stat (h, "expired", 1);
+  fail_unless_equals_uint64 (budget_stat (h, "coalesced"), 1);
+  budget_request (h, 2);
+  fail_unless (gst_harness_wait_for_clock_id_waits (h, 1, 3));
+  fail_unless (gst_harness_push_event (h, gst_event_new_eos ()));
+  fail_unless_equals_uint64 (budget_stat (h, "cancelled"), 1);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 0);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+GST_START_TEST (test_rtx_budget_history_identity_wrap_and_reset)
+{
+  GstHarness *h = budget_harness (43, 86, 100000);
+  guint i;
+  budget_original (h, 0);
+  budget_original (h, 1);
+  budget_request (h, 0);
+  gst_buffer_unref (gst_harness_pull (h));
+  budget_wait_stat (h, "queue-bytes", 0);
+  budget_request (h, 1);
+  for (i = 2; i <= 65537; i++)
+    budget_original (h, (guint16) i);
+  budget_request (h, 1);
+  fail_unless_equals_uint64 (budget_stat (h, "coalesced"), 0);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 86);
+  fail_unless (gst_harness_push_event (h, gst_event_new_stream_start ("replacement")));
+  fail_unless_equals_uint64 (budget_stat (h, "cancelled"), 2);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 0);
+  budget_request (h, 1);
+  fail_unless_equals_uint64 (budget_stat (h, "cache-misses"), 1);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+
+static GstFlowReturn
+budget_failed_push (GstPad * pad, GstObject * parent, GstBuffer * buffer)
+{
+  gst_buffer_unref (buffer);
+  return GST_FLOW_ERROR;
+}
+
+GST_START_TEST (test_rtx_budget_failed_handoff)
+{
+  GstHarness *h = budget_harness (43, 86, 1000);
+  budget_original (h, 0);
+  gst_pad_set_chain_function (h->sinkpad, budget_failed_push);
+  budget_request (h, 0);
+  budget_wait_stat (h, "push-failures", 1);
+  fail_unless_equals_uint64 (budget_stat (h, "handoff-attempt-bytes"), 43);
+  fail_unless_equals_uint64 (budget_stat (h, "handoff-accepted-bytes"), 0);
+  fail_unless_equals_uint64 (budget_stat (h, "queue-bytes"), 0);
+  budget_request (h, 0);
+  fail_unless_equals_uint64 (budget_stat (h, "cancelled"), 1);
+  fail_unless_equals_uint64 (budget_stat (h, "handoff-attempts"), 1);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
 static Suite *
 rtprtx_suite (void)
 {
@@ -1172,7 +1458,14 @@ rtprtx_suite (void)
 
   suite_add_tcase (s, tc_chain);
 
+  tcase_add_test (tc_chain, test_rtx_budget_in_progress_reservation);
+  tcase_add_test (tc_chain, test_rtx_budget_duplicate_deadline_and_eos);
+  tcase_add_test (tc_chain, test_rtx_budget_history_identity_wrap_and_reset);
+  tcase_add_test (tc_chain, test_rtx_budget_failed_handoff);
   tcase_add_test (tc_chain, test_rtxsend_basic);
+  tcase_add_test (tc_chain, test_rtx_budget_fifo_cap_coalescing);
+  tcase_add_test (tc_chain, test_rtx_budget_expiry_and_flush);
+  tcase_add_test (tc_chain, test_rtx_budget_zero_wait_and_oversize);
   tcase_add_test (tc_chain, test_rtxsend_disabled_enabled_disabled);
   tcase_add_test (tc_chain, test_rtxsend_configured_not_playing_cleans_up);
 
