@@ -1,0 +1,5 @@
+{
+  "upstream_release": "1.26.11",
+  "upstream_commit": "a85c0373c694f931fc52be6488cb8d7d23b48a5a",
+  "meson_version": "1.26.11.1"
+}

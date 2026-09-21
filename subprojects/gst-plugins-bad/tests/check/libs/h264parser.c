@@ -907,19 +907,20 @@ GST_START_TEST (test_h264_parse_svc_slice_ext)
     0x3f, 0x53, 0xe1
   };
 
-  res = gst_h264_parser_identify_nalu (parser, h264_sps, 0, sizeof (h264_sps),
-      &sps_nalu);
+  /* Each fixture is a complete NAL without a following start code. */
+  res = gst_h264_parser_identify_nalu_unchecked (parser, h264_sps, 0,
+      sizeof (h264_sps), &sps_nalu);
   assert_equals_int (res, GST_H264_PARSER_OK);
   res = gst_h264_parser_parse_sps (parser, &sps_nalu, &sps);
   assert_equals_int (res, GST_H264_PARSER_OK);
 
-  res = gst_h264_parser_identify_nalu (parser, h264_pps, 0, sizeof (h264_pps),
-      &pps_nalu);
+  res = gst_h264_parser_identify_nalu_unchecked (parser, h264_pps, 0,
+      sizeof (h264_pps), &pps_nalu);
   assert_equals_int (res, GST_H264_PARSER_OK);
   res = gst_h264_parser_parse_pps (parser, &pps_nalu, &pps);
   assert_equals_int (res, GST_H264_PARSER_OK);
 
-  res = gst_h264_parser_identify_nalu (parser, h264_svc_idr, 0,
+  res = gst_h264_parser_identify_nalu_unchecked (parser, h264_svc_idr, 0,
       sizeof (h264_svc_idr), &svc_nalu);
   assert_equals_int (res, GST_H264_PARSER_OK);
   fail_unless (GST_H264_IS_SVC_NALU (&svc_nalu));

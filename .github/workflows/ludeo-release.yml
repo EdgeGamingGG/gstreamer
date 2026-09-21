@@ -1,0 +1,93 @@
+name: Release Ludeo GStreamer
+run-name: Release native ${{ inputs.ludeo_version }} at ${{ inputs.expected_sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      ludeo_version:
+        description: Ludeo MAJOR.MINOR.PATCH (baseline 1.0.0; RTX 1.1.0)
+        required: true
+        type: string
+      expected_sha:
+        description: Exact 40-character commit SHA on ludeo to test and release
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: ludeo-native-release
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the selected ludeo commit
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/ludeo
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+      - name: Validate source and release version
+        id: release
+        env:
+          LUDEO_VERSION: ${{ inputs.ludeo_version }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: python3 .github/scripts/ludeo_release.py --version "$LUDEO_VERSION" --expected-sha "$EXPECTED_SHA" --output /tmp/native-release.json
+  test:
+    needs: validate
+    uses: ./.github/workflows/ludeo-native-ci.yml
+    with:
+      source_sha: ${{ github.sha }}
+  publish:
+    needs: [validate, test]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-test-evidence
+          path: release/test-evidence
+      - name: Revalidate source and generate provenance
+        env:
+          LUDEO_VERSION: ${{ inputs.ludeo_version }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          LUDEO_VALIDATION_RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/ludeo_release.py --version "$LUDEO_VERSION" --expected-sha "$EXPECTED_SHA" --output release/native-release.json
+          tar -czf release/native-test-evidence.tar.gz -C release/test-evidence .
+          cd release
+          sha256sum native-release.json native-test-evidence.tar.gz > SHA256SUMS
+      - name: Publish immutable annotated release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git show-ref --verify --quiet "refs/tags/$TAG"; then
+            git tag -a "$TAG" "$EXPECTED_SHA" -m "Ludeo GStreamer $TAG; validation $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$EXPECTED_SHA"
+          git push origin "refs/tags/$TAG"
+          if gh release view "$TAG" --json isDraft > /tmp/existing-release.json; then
+            if python3 -c 'import json,sys; sys.exit(0 if not json.load(open("/tmp/existing-release.json"))["isDraft"] else 1)'; then
+              echo "Release $TAG is already published at the expected commit."
+              exit 0
+            fi
+          else
+            printf 'Native source release `%s` at `%s`.\n\nSee the attached provenance and CPU regression-test evidence. NVENC hardware and application qualification remain product release checks.\n' "$TAG" "$EXPECTED_SHA" > /tmp/release-notes.md
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes-file /tmp/release-notes.md
+          fi
+          gh release upload "$TAG" release/native-release.json release/native-test-evidence.tar.gz release/SHA256SUMS --clobber
+          gh release edit "$TAG" --draft=false --prerelease=false --latest=false
