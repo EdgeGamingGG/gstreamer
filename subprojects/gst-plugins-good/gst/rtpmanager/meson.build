@@ -39,6 +39,7 @@ rtpmanager_headers = [
   'gstrtphdrext-mid.h',
   'rtptwcc.h',
   'gstrtprtxsend.h',
+  'gstrtprtxsendbudget.h',
   'gstrtphdrext-streamid.h',
   'gstrtpst2022-1-fecenc.h',
   'rtpjitterbuffer.h',
