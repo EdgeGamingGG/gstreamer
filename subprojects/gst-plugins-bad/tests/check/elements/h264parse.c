@@ -1581,6 +1581,9 @@ GST_START_TEST (test_parse_svc_prefix_and_slice_ext)
       sizeof (h264_svc_stream), NULL, NULL);
   fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
 
+  /* Drain the final access unit: this byte stream has no following delimiter. */
+  fail_unless (gst_harness_push_event (h, gst_event_new_eos ()));
+  fail_unless_equals_int (gst_harness_buffers_in_queue (h), 1);
   out = gst_harness_pull (h);
   fail_unless (out != NULL);
   fail_unless (!GST_BUFFER_FLAG_IS_SET (out, GST_BUFFER_FLAG_DELTA_UNIT));

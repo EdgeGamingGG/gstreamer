@@ -1,0 +1,44 @@
+name: Ludeo native CI
+on:
+  pull_request:
+    branches: [ludeo]
+  push:
+    branches: [ludeo]
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  native:
+    name: Native build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test release validation
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build pkg-config flex bison python3-venv libglib2.0-dev libssl-dev libsrtp2-dev libusrsctp-dev libnice-dev
+          python3 -m venv .venv-ci
+          .venv-ci/bin/pip install meson==1.11.1
+          echo "$PWD/.venv-ci/bin" >> "$GITHUB_PATH"
+      - name: Compile native plugins and run regression tests
+        run: bash .github/scripts/test-native.sh
+      - name: Preserve native test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-test-evidence
+          path: |
+            build-ludeo/meson-logs/
+            build-ludeo/meson-info/intro-buildoptions.json
+          if-no-files-found: error
