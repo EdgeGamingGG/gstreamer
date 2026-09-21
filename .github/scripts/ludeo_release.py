@@ -43,8 +43,11 @@ def prepare(version, expected_sha):
     for existing in git("tag", "--list", prefix + "*").splitlines():
         if version_tuple(existing.removeprefix(prefix)) > requested:
             raise ValueError(f"Version is older than published tag {existing}")
-        if existing == tag and git("rev-parse", f"refs/tags/{tag}^{{commit}}") != expected_sha:
-            raise ValueError(f"Tag {tag} already identifies another commit; never move release tags")
+        if existing == tag:
+            if git("rev-parse", f"refs/tags/{tag}^{{commit}}") != expected_sha:
+                raise ValueError(f"Tag {tag} already identifies another commit; never move release tags")
+            if git("cat-file", "-t", f"refs/tags/{tag}") != "tag":
+                raise ValueError(f"Tag {tag} is not annotated; choose a new release version")
     return {
         "schema_version": 1,
         "repository": "https://github.com/EdgeGamingGG/gstreamer",

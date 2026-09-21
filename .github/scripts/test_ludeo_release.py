@@ -60,6 +60,11 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "another commit"):
             release.prepare("1.0.0", self.sha)
 
+    def test_existing_lightweight_tag_is_rejected(self):
+        self.git("tag", "1.26.11-ludeo.1.0.0")
+        with self.assertRaisesRegex(ValueError, "not annotated"):
+            release.prepare("1.0.0", self.sha)
+
     def test_versions_compare_numerically(self):
         self.git("tag", "1.26.11-ludeo.1.9.0")
         release.prepare("1.10.0", self.sha)
