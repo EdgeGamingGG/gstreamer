@@ -341,7 +341,8 @@ gst_rtp_ulpfec_enc_stream_ctx_prepend_to_fec_buffer (GstRtpUlpFecEncStreamCtx *
 static GstFlowReturn
 gst_rtp_ulpfec_enc_stream_ctx_push_fec_packets (GstRtpUlpFecEncStreamCtx * ctx,
     guint8 pt, guint16 seq, guint32 timestamp, guint32 ssrc, guint8 twcc_ext_id,
-    GstRTPHeaderExtensionFlags twcc_ext_flags, guint8 twcc_appbits)
+    GstRTPHeaderExtensionFlags twcc_ext_flags, guint8 twcc_appbits,
+    const GstRTPFrameSendInfo * frame_send)
 {
   GstFlowReturn ret = GST_FLOW_OK;
   guint fec_packets_num =
@@ -362,6 +363,15 @@ gst_rtp_ulpfec_enc_stream_ctx_push_fec_packets (GstRtpUlpFecEncStreamCtx * ctx,
                 seq + fec_packets_pushed, timestamp, ssrc))) {
       gst_buffer_copy_into (fec, latest_packet, GST_BUFFER_COPY_TIMESTAMPS, 0,
           -1);
+
+      if (frame_send && frame_send->expected_packets) {
+        GstRTPFrameSendInfo info = *frame_send;
+        info.fec = TRUE;
+        info.packet_index = frame_send->expected_packets + fec_packets_pushed;
+        info.expected_packets = ctx->fec_packet_idx == fec_packets_num ?
+            frame_send->expected_packets + fec_packets_num : 0;
+        gst_buffer_add_rtp_frame_send_meta (fec, &info);
+      }
 
       /* If buffers in the stream we are protecting were meant to hold a TWCC seqnum,
        * we also indicate that our protection buffers need one. At this point no seqnum
@@ -521,6 +531,19 @@ gst_rtp_ulpfec_enc_stream_ctx_process (GstRtpUlpFecEncStreamCtx * ctx,
   gboolean empty_packet_buffer = FALSE;
   GstRTPHeaderExtensionFlags twcc_ext_flags = 0;
   guint8 twcc_appbits = 0;
+  GstRTPFrameSendInfo frame_send = { 0 };
+  GstRTPFrameSendMeta *send_meta = gst_buffer_get_rtp_frame_send_meta (buffer);
+
+  /* Only marker-delimited video protection groups have this frame contract.
+   * Per-packet FEC (audio) must not accidentally publish a complete frame. */
+  if (send_meta && !ctx->multipacket) {
+    buffer = gst_buffer_make_writable (buffer);
+    send_meta = gst_buffer_get_rtp_frame_send_meta (buffer);
+    gst_buffer_remove_meta (buffer, &send_meta->meta);
+    send_meta = NULL;
+  }
+  if (send_meta)
+    frame_send = send_meta->info;
 
   ctx->num_packets_received++;
 
@@ -562,11 +585,20 @@ gst_rtp_ulpfec_enc_stream_ctx_process (GstRtpUlpFecEncStreamCtx * ctx,
 
     gst_rtp_buffer_unmap (&rtp);
 
+    /* Move the producer's local boundary before pushing the media packet.
+     * RTP's marker remains unchanged. Zero generated repair retains it. */
+    if (frame_send.expected_packets &&
+        gst_rtp_ulpfec_enc_stream_ctx_get_fec_packets_num (ctx) > 0) {
+      buffer = gst_buffer_make_writable (buffer);
+      gst_buffer_get_rtp_frame_send_meta (buffer)->info.expected_packets = 0;
+    }
+
     ret = gst_pad_push (ctx->srcpad, buffer);
     if (GST_FLOW_OK == ret)
       ret =
           gst_rtp_ulpfec_enc_stream_ctx_push_fec_packets (ctx, ctx->pt, fec_seq,
-          fec_timestamp, fec_ssrc, twcc_ext_id, twcc_ext_flags, twcc_appbits);
+          fec_timestamp, fec_ssrc, twcc_ext_id, twcc_ext_flags, twcc_appbits,
+          &frame_send);
   } else {
     gst_rtp_buffer_unmap (&rtp);
     ret = gst_pad_push (ctx->srcpad, buffer);
