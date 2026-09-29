@@ -24,6 +24,73 @@
 #include "gstrtpmeta.h"
 #include <string.h>
 
+static gboolean
+frame_send_meta_init (GstMeta * meta, gpointer params, GstBuffer * buffer)
+{
+  memset (&((GstRTPFrameSendMeta *) meta)->info, 0,
+      sizeof (GstRTPFrameSendInfo));
+  return TRUE;
+}
+
+static gboolean
+frame_send_meta_transform (GstBuffer * dest, GstMeta * meta,
+    GstBuffer * src, GQuark type, gpointer data)
+{
+  /* Whole-buffer metadata copies preserve packet identity through RED/SRTP.
+   * A sliced packet must not acquire an independent submission identity. */
+  if (GST_META_TRANSFORM_IS_COPY (type)) {
+    if (((GstMetaTransformCopy *) data)->region)
+      return TRUE;
+    return gst_buffer_add_rtp_frame_send_meta (dest,
+        &((GstRTPFrameSendMeta *) meta)->info) != NULL;
+  }
+  return FALSE;
+}
+
+GType
+gst_rtp_frame_send_meta_api_get_type (void)
+{
+  static gsize type = 0;
+  static const gchar *tags[] = { NULL };
+  if (g_once_init_enter (&type)) {
+    GType value = gst_meta_api_type_register ("GstRTPFrameSendMetaAPI", tags);
+    g_once_init_leave (&type, value);
+  }
+  return (GType) type;
+}
+
+const GstMetaInfo *
+gst_rtp_frame_send_meta_get_info (void)
+{
+  static gsize info = 0;
+  if (g_once_init_enter (&info)) {
+    const GstMetaInfo *value = gst_meta_register (
+        GST_RTP_FRAME_SEND_META_API_TYPE, "GstRTPFrameSendMeta",
+        sizeof (GstRTPFrameSendMeta), frame_send_meta_init, NULL,
+        frame_send_meta_transform);
+    g_once_init_leave (&info, (gsize) value);
+  }
+  return (const GstMetaInfo *) info;
+}
+
+GstRTPFrameSendMeta *
+gst_buffer_add_rtp_frame_send_meta (GstBuffer * buffer,
+    const GstRTPFrameSendInfo * info)
+{
+  GstRTPFrameSendMeta *meta = (GstRTPFrameSendMeta *)
+      gst_buffer_add_meta (buffer, GST_RTP_FRAME_SEND_META_INFO, NULL);
+  if (meta && info)
+    meta->info = *info;
+  return meta;
+}
+
+GstRTPFrameSendMeta *
+gst_buffer_get_rtp_frame_send_meta (GstBuffer * buffer)
+{
+  return (GstRTPFrameSendMeta *) gst_buffer_get_meta (buffer,
+      GST_RTP_FRAME_SEND_META_API_TYPE);
+}
+
 /**
  * SECTION:gstrtpmeta
  * @title: GstMeta for RTP

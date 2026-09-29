@@ -74,6 +74,35 @@ gboolean            gst_rtp_source_meta_append_csrc      (GstRTPSourceMeta * met
 GST_RTP_API
 const GstMetaInfo * gst_rtp_source_meta_get_info         (void);
 
+/* Local initial-frame submission identity. Never serialized into RTP. Packet
+ * indices are zero based; expected_packets is nonzero only on the final packet
+ * produced for the frame (including its initial FEC tail). */
+typedef struct {
+  guint64 frame_id;
+  guint64 extended_rtp_timestamp;
+  gint64 pts_ns;
+  gint64 capture_ts_ns;
+  gint64 capture_output_ns;
+  guint32 ssrc;
+  guint32 rtp_timestamp;
+  guint32 packet_index;
+  guint32 expected_packets;
+  gboolean fec;
+} GstRTPFrameSendInfo;
+
+typedef struct {
+  GstMeta meta;
+  GstRTPFrameSendInfo info;
+} GstRTPFrameSendMeta;
+
+#define GST_RTP_FRAME_SEND_META_API_TYPE (gst_rtp_frame_send_meta_api_get_type ())
+#define GST_RTP_FRAME_SEND_META_INFO (gst_rtp_frame_send_meta_get_info ())
+
+GST_RTP_API GType gst_rtp_frame_send_meta_api_get_type (void);
+GST_RTP_API const GstMetaInfo * gst_rtp_frame_send_meta_get_info (void);
+GST_RTP_API GstRTPFrameSendMeta * gst_buffer_add_rtp_frame_send_meta (GstBuffer * buffer, const GstRTPFrameSendInfo * info);
+GST_RTP_API GstRTPFrameSendMeta * gst_buffer_get_rtp_frame_send_meta (GstBuffer * buffer);
+
 G_END_DECLS
 
 #endif /* __GST_RTP_META_H__ */
