@@ -63,6 +63,12 @@ enum
   PROP_NUM_RTX_REQUESTS,
   PROP_NUM_RTX_PACKETS,
   PROP_CLOCK_RATE_MAP,
+  PROP_BUDGET_ENABLED,
+  PROP_BUDGET_BPS,
+  PROP_BUDGET_BURST,
+  PROP_BUDGET_TIME,
+  PROP_BUDGET_CAP,
+  PROP_BUDGET_STATS,
 };
 
 enum
@@ -161,6 +167,9 @@ GST_ELEMENT_REGISTER_DEFINE (rtprtxsend, "rtprtxsend", GST_RANK_NONE,
 typedef struct
 {
   guint16 seqnum;
+  /* Unique history occurrence, retained by pending repairs across eviction and
+   * sequence wrap. Never reused when a stream or the element is reset. */
+  guint64 history_id;
   guint32 timestamp;
   GstBuffer *buffer;
 } BufferQueueItem;
@@ -208,10 +217,14 @@ typedef enum
   RTX_TASK_STOP,
 } RtxTaskState;
 
+static GstBuffer *gst_rtp_rtx_buffer_new (GstRtpRtxSend * rtx, GstBuffer * buffer);
+#include "gstrtprtxsendbudget.h"
+
 static void
 gst_rtp_rtx_send_set_flushing (GstRtpRtxSend * rtx, gboolean flush)
 {
   GST_OBJECT_LOCK (rtx);
+  rtx_budget_flush (rtx->budget, flush);
   gst_data_queue_set_flushing (rtx->queue, flush);
   gst_data_queue_flush (rtx->queue);
   GST_OBJECT_UNLOCK (rtx);
@@ -305,6 +318,35 @@ gst_rtp_rtx_send_class_init (GstRtpRtxSendClass * klass)
           "Map of payload types to their clock rates",
           GST_TYPE_STRUCTURE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_BUDGET_ENABLED,
+      g_param_spec_boolean ("rtx-budget-enabled", "RTX budget enabled",
+          "Enable the fixed-rate, bounded repair queue (configure before media)",
+          FALSE,
+          G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_BUDGET_BPS,
+      g_param_spec_uint64 ("rtx-budget-bps", "RTX allowance",
+          "Sustained clear RTX RTP bits per second", 1, G_MAXUINT, 3800000,
+          G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_BUDGET_BURST,
+      g_param_spec_uint64 ("rtx-budget-burst-bytes", "RTX burst allowance",
+          "Maximum accumulated credit in complete RTX RTP bytes", 1,
+          RTX_BUDGET_MAX_BYTES, 4750,
+          G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_BUDGET_TIME,
+      g_param_spec_uint ("rtx-budget-max-queue-time", "RTX queue deadline",
+          "Maximum additional waiting in milliseconds (0 = no waiting)",
+          0, G_MAXUINT, 20,
+          G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_BUDGET_CAP,
+      g_param_spec_uint64 ("rtx-budget-max-queue-bytes", "RTX queue byte cap",
+          "Maximum complete RTX bytes waiting or in a downstream push", 1,
+          G_MAXUINT, 9500,
+          G_PARAM_READWRITE | GST_PARAM_MUTABLE_READY | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_BUDGET_STATS,
+      g_param_spec_boxed ("rtx-budget-stats", "RTX budget statistics",
+          "Authoritative admission, drop, handoff and pending-byte counters",
+          GST_TYPE_STRUCTURE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
   /**
    * rtprtxsend::add-extension:
    *
@@ -354,6 +396,9 @@ gst_rtp_rtx_send_reset (GstRtpRtxSend * rtx)
 {
   GST_OBJECT_LOCK (rtx);
   gst_data_queue_flush (rtx->queue);
+  rtx_budget_flush (rtx->budget, TRUE);
+  rtx->budget->started = FALSE;
+  gst_clear_object (&rtx->budget->clock);
   g_hash_table_remove_all (rtx->ssrc_data);
   g_hash_table_remove_all (rtx->rtx_ssrcs);
   rtx->num_rtx_requests = 0;
@@ -377,6 +422,7 @@ gst_rtp_rtx_send_finalize (GObject * object)
   if (rtx->clock_rate_map_structure)
     gst_structure_free (rtx->clock_rate_map_structure);
   g_object_unref (rtx->queue);
+  rtx_budget_free (rtx->budget);
 
   gst_clear_object (&rtx->rid_stream);
   gst_clear_object (&rtx->rid_repaired);
@@ -415,6 +461,7 @@ gst_rtp_rtx_send_init (GstRtpRtxSend * rtx)
       GST_DEBUG_FUNCPTR (gst_rtp_rtx_send_chain_list));
   gst_element_add_pad (GST_ELEMENT (rtx), rtx->sinkpad);
 
+  rtx->budget = rtx_budget_new ();
   rtx->queue = gst_data_queue_new (gst_rtp_rtx_send_queue_check_full, NULL,
       NULL, rtx);
   rtx->ssrc_data = g_hash_table_new_full (g_direct_hash, g_direct_equal,
@@ -766,6 +813,12 @@ gst_rtp_rtx_send_src_event (GstPad * pad, GstObject * parent, GstEvent * event)
         guint seqnum = 0;
         guint ssrc = 0;
         GstBuffer *rtx_buf = NULL;
+        GstClock *clock = NULL;
+        if (rtx->budget->enabled) {
+          clock = gst_element_get_clock (GST_ELEMENT (rtx));
+          if (!clock)
+            clock = gst_system_clock_obtain ();
+        }
 
         /* retrieve seqnum of the packet that need to be retransmitted */
         if (!gst_structure_get_uint (s, "seqnum", &seqnum))
@@ -779,6 +832,14 @@ gst_rtp_rtx_send_src_event (GstPad * pad, GstObject * parent, GstEvent * event)
             seqnum, ssrc);
 
         GST_OBJECT_LOCK (rtx);
+        if (rtx->budget->enabled) {
+          rtx->budget->counters[BUDGET_REQUESTS]++;
+          if (!rtx->budget->clock) {
+            rtx->budget->clock = gst_object_ref (clock);
+            rtx->budget->last_refill = gst_clock_get_time (clock);
+          }
+        }
+        gst_clear_object (&clock);
         /* check if request is for us */
         if (g_hash_table_contains (rtx->ssrc_data, GUINT_TO_POINTER (ssrc))) {
           SSRCRtxData *data;
@@ -793,10 +854,15 @@ gst_rtp_rtx_send_src_event (GstPad * pad, GstObject * parent, GstEvent * event)
           search_item.seqnum = seqnum;
           iter = g_sequence_lookup (data->queue, &search_item,
               (GCompareDataFunc) buffer_queue_items_cmp, NULL);
+          if (!iter && rtx->budget->enabled)
+            rtx->budget->counters[BUDGET_CACHE_MISSES]++;
           if (iter) {
             BufferQueueItem *item = g_sequence_get (iter);
             GST_LOG_OBJECT (rtx, "found %u", item->seqnum);
-            rtx_buf = gst_rtp_rtx_buffer_new (rtx, item->buffer);
+            if (rtx->budget->enabled)
+              rtx_budget_admit (rtx, item);
+            else
+              rtx_buf = gst_rtp_rtx_buffer_new (rtx, item->buffer);
           }
 #ifndef GST_DISABLE_DEBUG
           else {
@@ -818,6 +884,8 @@ gst_rtp_rtx_send_src_event (GstPad * pad, GstObject * parent, GstEvent * event)
             }
           }
 #endif
+        } else if (rtx->budget->enabled) {
+          rtx->budget->counters[BUDGET_CACHE_MISSES]++;
         }
         GST_OBJECT_UNLOCK (rtx);
 
@@ -896,6 +964,17 @@ gst_rtp_rtx_send_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   GstRtpRtxSend *rtx = GST_RTP_RTX_SEND_CAST (parent);
 
   switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_STREAM_START:
+      GST_OBJECT_LOCK (rtx);
+      if (rtx->budget->enabled && rtx->budget->started) {
+        /* New stream identity: discard old waiting repairs and history. A
+         * handoff already in progress keeps its reservation until completion. */
+        rtx_budget_flush (rtx->budget, rtx->budget->flushing);
+        g_hash_table_remove_all (rtx->ssrc_data);
+        g_hash_table_remove_all (rtx->rtx_ssrcs);
+      }
+      GST_OBJECT_UNLOCK (rtx);
+      break;
     case GST_EVENT_FLUSH_START:
       gst_pad_push_event (rtx->srcpad, event);
       gst_rtp_rtx_send_set_task_state (rtx, RTX_TASK_PAUSE);
@@ -905,6 +984,10 @@ gst_rtp_rtx_send_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
       gst_rtp_rtx_send_set_task_state (rtx, RTX_TASK_START);
       return TRUE;
     case GST_EVENT_EOS:
+      if (rtx->budget->enabled) {
+        gst_rtp_rtx_send_set_flushing (rtx, TRUE);
+        return gst_pad_push_event (rtx->srcpad, event);
+      }
       GST_INFO_OBJECT (rtx, "Got EOS - enqueueing it");
       gst_rtp_rtx_send_push_out (rtx, event);
       return TRUE;
@@ -1041,9 +1124,11 @@ process_buffer (GstRtpRtxSend * rtx, GstBuffer * buffer)
               GUINT_TO_POINTER (payload_type)));
     }
 
+    rtx->budget->started = TRUE;
     /* add current rtp buffer to queue history */
     item = g_new0 (BufferQueueItem, 1);
     item->seqnum = seqnum;
+    item->history_id = ++rtx->budget->next_history_id;
     item->timestamp = rtptime;
     item->buffer = gst_buffer_ref (buffer);
     g_sequence_append (data->queue, item);
@@ -1103,6 +1188,11 @@ gst_rtp_rtx_send_src_loop (GstRtpRtxSend * rtx)
 {
   GstDataQueueItem *data;
 
+  if (rtx->budget->enabled) {
+    rtx_budget_loop (rtx);
+    return;
+  }
+
   if (gst_data_queue_pop (rtx->queue, &data)) {
     GST_LOG_OBJECT (rtx, "pushing rtx buffer %p", data->object);
 
@@ -1160,6 +1250,33 @@ gst_rtp_rtx_send_get_property (GObject * object,
     guint prop_id, GValue * value, GParamSpec * pspec)
 {
   GstRtpRtxSend *rtx = GST_RTP_RTX_SEND_CAST (object);
+
+  if (prop_id >= PROP_BUDGET_ENABLED && prop_id <= PROP_BUDGET_STATS) {
+    GstRtpRtxBudget *b = rtx->budget;
+    GST_OBJECT_LOCK (rtx);
+    switch (prop_id) {
+      case PROP_BUDGET_ENABLED:
+        g_value_set_boolean (value, b->enabled);
+        break;
+      case PROP_BUDGET_BPS:
+        g_value_set_uint64 (value, b->rate);
+        break;
+      case PROP_BUDGET_BURST:
+        g_value_set_uint64 (value, b->burst);
+        break;
+      case PROP_BUDGET_TIME:
+        g_value_set_uint (value, b->max_time_ms);
+        break;
+      case PROP_BUDGET_CAP:
+        g_value_set_uint64 (value, b->cap);
+        break;
+      case PROP_BUDGET_STATS:
+        g_value_take_boxed (value, rtx_budget_stats (b));
+        break;
+    }
+    GST_OBJECT_UNLOCK (rtx);
+    return;
+  }
 
   switch (prop_id) {
     case PROP_PAYLOAD_TYPE_MAP:
@@ -1220,6 +1337,36 @@ gst_rtp_rtx_send_set_property (GObject * object,
     guint prop_id, const GValue * value, GParamSpec * pspec)
 {
   GstRtpRtxSend *rtx = GST_RTP_RTX_SEND_CAST (object);
+
+  if (prop_id >= PROP_BUDGET_ENABLED && prop_id < PROP_BUDGET_STATS) {
+    GstRtpRtxBudget *b = rtx->budget;
+    GST_OBJECT_LOCK (rtx);
+    if (b->started || GST_STATE (rtx) > GST_STATE_READY ||
+        GST_PAD_MODE (rtx->srcpad) != GST_PAD_MODE_NONE) {
+      GST_WARNING_OBJECT (rtx, "RTX budget is startup-only; ignoring %s", pspec->name);
+    } else {
+      switch (prop_id) {
+        case PROP_BUDGET_ENABLED:
+          b->enabled = g_value_get_boolean (value);
+          break;
+        case PROP_BUDGET_BPS:
+          b->rate = g_value_get_uint64 (value);
+          break;
+        case PROP_BUDGET_BURST:
+          b->burst = g_value_get_uint64 (value);
+          break;
+        case PROP_BUDGET_TIME:
+          b->max_time_ms = g_value_get_uint (value);
+          break;
+        case PROP_BUDGET_CAP:
+          b->cap = g_value_get_uint64 (value);
+          break;
+      }
+      b->credit = b->burst * 8 * GST_SECOND;
+    }
+    GST_OBJECT_UNLOCK (rtx);
+    return;
+  }
 
   switch (prop_id) {
     case PROP_SSRC_MAP:
