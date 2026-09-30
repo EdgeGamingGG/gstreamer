@@ -49,18 +49,32 @@ struct _GstRtpRedEnc {
   GstPad *sinkpad;
 
   gint pt;
-  guint num_sent;
-  guint distance;
+  gint num_sent;
+  gint distance; /* atomic; history is owned by the streaming thread */
   gboolean allow_no_red_blocks;
 
   GQueue *rtp_history;
-  gboolean send_caps;
+  gint last_output_pt;
   gboolean is_current_caps_red;
   guint8 twcc_ext_id;
 
   gboolean ignoring_extension_warned;
 
   gint exclude_pt; /* -1 = wrap all PTs; >= 0 = pass through this PT unchanged */
+  gint media_pt; /* -1 = all; otherwise wrap only media_pt and fec_pt */
+  gint fec_pt;
+  gint exact_distance;
+  gint mtu; /* 0 = unlimited, includes the RTP header and extensions */
+  guint32 history_ssrc;
+  gboolean have_history_ssrc;
+  gint redundant_sent;
+  gint skipped_history;
+  gint skipped_size;
+  gint skipped_format;
+  gint history_resets;
+  /* Summary state is owned by the streaming thread, like payload history. */
+  gint64 last_report_us;
+  guint report_counters[6];
 };
 
 GType gst_rtp_red_enc_get_type (void);

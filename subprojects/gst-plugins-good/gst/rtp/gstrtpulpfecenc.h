@@ -53,6 +53,7 @@ struct _GstRtpUlpFecEnc {
 
   /* properties */
   guint pt;
+  gint media_pt; /* atomic: -1 = all payload types */
   guint32 ssrc;
   guint percentage;
   guint percentage_important;

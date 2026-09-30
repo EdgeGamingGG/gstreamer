@@ -866,6 +866,292 @@ GST_START_TEST (rtpredenc_too_large_length)
 
 GST_END_TEST;
 
+/* Audio RED uses exact packet distance and never changes the outer RTP
+ * identity when changing its redundancy settings. */
+static void
+check_audio_red_packet (GstHarness * h, guint16 seq, guint32 timestamp,
+    guint32 ssrc, guint flags, gint redundant_seq)
+{
+  GstBuffer *input = _new_rtp_buffer (TRUE, 0, PT_MEDIA, seq, timestamp,
+      ssrc, 16);
+  GstBuffer *output;
+  GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+  guint8 *payload;
+
+  GST_BUFFER_FLAGS (input) |= flags;
+  fail_unless (gst_rtp_buffer_map (input, GST_MAP_WRITE, &rtp));
+  memset (gst_rtp_buffer_get_payload (&rtp), seq & 0xff, 16);
+  gst_rtp_buffer_unmap (&rtp);
+  output = gst_harness_push_and_pull (h, input);
+  fail_unless (gst_rtp_buffer_map (output, GST_MAP_READ, &rtp));
+  fail_unless_equals_int (gst_rtp_buffer_get_payload_type (&rtp), PT_RED);
+  fail_unless_equals_int (gst_rtp_buffer_get_seq (&rtp), seq);
+  fail_unless_equals_int (gst_rtp_buffer_get_timestamp (&rtp), timestamp);
+  fail_unless_equals_int (gst_rtp_buffer_get_ssrc (&rtp), ssrc);
+  payload = gst_rtp_buffer_get_payload (&rtp);
+  fail_unless_equals_int (!!(payload[0] & 0x80), redundant_seq >= 0);
+  fail_unless_equals_int (gst_rtp_buffer_get_payload_len (&rtp),
+      redundant_seq >= 0 ? 37 : 17);
+  if (redundant_seq >= 0) {
+    fail_unless_equals_int (payload[5], redundant_seq & 0xff);
+    fail_unless_equals_int (payload[21], seq & 0xff);
+  } else {
+    fail_unless_equals_int (payload[1], seq & 0xff);
+  }
+  gst_rtp_buffer_unmap (&rtp);
+  gst_buffer_unref (output);
+}
+
+GST_START_TEST (rtpredenc_audio_live_distance)
+{
+  GstHarness *h = gst_harness_new ("rtpredenc");
+  guint16 seq = 65533;
+  guint32 timestamp = G_MAXUINT32 - 480;
+  guint i;
+  guint redundant, skipped;
+
+  g_object_set (h->element, "pt", PT_RED, "distance", 1u,
+      "exact-distance", TRUE, "mtu", 1200u, NULL);
+  gst_harness_set_src_caps_str (h, GST_RTP_RED_ENC_CAPS_STR);
+  check_audio_red_packet (h, seq, timestamp, 42, 0, -1);
+  for (i = 1; i <= 3; i++)
+    check_audio_red_packet (h, seq + i, timestamp + 480 * i, 42, 0,
+        (guint16) (seq + i - 1));
+  g_object_set (h->element, "distance", 3u, NULL);
+  check_audio_red_packet (h, seq + 4, timestamp + 480 * 4, 42, 0, -1);
+  check_audio_red_packet (h, seq + 5, timestamp + 480 * 5, 42, 0, -1);
+  check_audio_red_packet (h, seq + 6, timestamp + 480 * 6, 42, 0,
+      (guint16) (seq + 3));
+  g_object_set (h->element, "distance", 0u, NULL);
+  check_audio_red_packet (h, seq + 7, timestamp + 480 * 7, 42, 0, -1);
+  g_object_set (h->element, "distance", 2u, NULL);
+  check_audio_red_packet (h, seq + 8, timestamp + 480 * 8, 42, 0, -1);
+  check_audio_red_packet (h, seq + 9, timestamp + 480 * 9, 42, 0, -1);
+  check_audio_red_packet (h, seq + 10, timestamp + 480 * 10, 42, 0,
+      (guint16) (seq + 8));
+  g_object_get (h->element, "redundant-sent", &redundant,
+      "skipped-history", &skipped, NULL);
+  fail_unless_equals_int (redundant, 5);
+  fail_unless_equals_int (skipped, 5);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+GST_START_TEST (rtpredenc_audio_telemetry)
+{
+  GstHarness *h = gst_harness_new ("rtpredenc");
+  GstBus *bus = gst_bus_new ();
+  GstMessage *message;
+  const GstStructure *stats;
+  gboolean degraded;
+  guint skipped, i;
+  gst_element_set_bus (h->element, bus);
+  g_object_set (h->element, "pt", PT_RED, "distance", 1u,
+      "exact-distance", TRUE, "mtu", 40u, NULL);
+  gst_harness_set_src_caps_str (h, GST_RTP_RED_ENC_CAPS_STR);
+  check_audio_red_packet (h, 1, 480, 42, 0, -1);
+  message = gst_bus_pop_filtered (bus, GST_MESSAGE_ELEMENT);
+  fail_unless (message != NULL);
+  gst_message_unref (message);
+  for (i = 2; i <= 101; i++)
+    check_audio_red_packet (h, i, i * 480, 42, 0, -1);
+  fail_unless (gst_bus_pop_filtered (bus, GST_MESSAGE_ELEMENT) == NULL);
+  g_usleep (G_USEC_PER_SEC + 10000);
+  check_audio_red_packet (h, 102, 102 * 480, 42, 0, -1);
+  message = gst_bus_pop_filtered (bus, GST_MESSAGE_ELEMENT);
+  fail_unless (message != NULL);
+  stats = gst_message_get_structure (message);
+  fail_unless (gst_structure_has_name (stats, "audio-red-stats"));
+  fail_unless (gst_structure_get_boolean (stats, "degraded", &degraded) && degraded);
+  fail_unless (gst_structure_get_uint (stats, "skipped-size-delta", &skipped));
+  fail_unless_equals_int (skipped, 101);
+  gst_message_unref (message);
+  /* EOS flushes the last partial interval, including recovery. */
+  g_object_set (h->element, "mtu", 1200u, NULL);
+  check_audio_red_packet (h, 103, 103 * 480, 42, 0, 102);
+  fail_unless (gst_harness_push_event (h, gst_event_new_eos ()));
+  message = gst_bus_pop_filtered (bus, GST_MESSAGE_ELEMENT);
+  fail_unless (message != NULL);
+  stats = gst_message_get_structure (message);
+  fail_unless (gst_structure_get_boolean (stats, "degraded", &degraded) && !degraded);
+  gst_message_unref (message);
+  gst_harness_teardown (h);
+  gst_object_unref (bus);
+}
+GST_END_TEST;
+
+GST_START_TEST (rtpredenc_primary_mtu_error_event)
+{
+  GstHarness *h = gst_harness_new ("rtpredenc");
+  GstBus *bus = gst_bus_new ();
+  GstMessage *message;
+  GError *error = NULL;
+  gst_element_set_bus (h->element, bus);
+  g_object_set (h->element, "pt", PT_RED, "distance", 1u,
+      "exact-distance", TRUE, "mtu", 20u, NULL);
+  gst_harness_set_src_caps_str (h, GST_RTP_RED_ENC_CAPS_STR);
+  fail_unless_equals_int (gst_harness_push (h,
+          _new_rtp_buffer (TRUE, 0, PT_MEDIA, 1, 480, 42, 16)), GST_FLOW_ERROR);
+  message = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR);
+  fail_unless (message != NULL);
+  gst_message_parse_error (message, &error, NULL);
+  fail_unless (strstr (error->message, "MTU") != NULL);
+  g_clear_error (&error);
+  gst_message_unref (message);
+  gst_harness_teardown (h);
+  gst_object_unref (bus);
+}
+GST_END_TEST;
+
+GST_START_TEST (rtpredenc_audio_resets_and_budget)
+{
+  GstHarness *h = gst_harness_new ("rtpredenc");
+  GstSegment segment;
+  guint skipped;
+
+  g_object_set (h->element, "pt", PT_RED, "distance", 1u,
+      "exact-distance", TRUE, "mtu", 1200u, NULL);
+  gst_harness_set_src_caps_str (h, GST_RTP_RED_ENC_CAPS_STR);
+  check_audio_red_packet (h, 1, 480, 42, 0, -1);
+  check_audio_red_packet (h, 2, 960, 42, 0, 1);
+  check_audio_red_packet (h, 3, 1440, 43, 0, -1); /* new SSRC */
+  check_audio_red_packet (h, 4, 1920, 43, GST_BUFFER_FLAG_DISCONT, -1);
+  check_audio_red_packet (h, 6, 2880, 43, 0, -1); /* missing N-1 */
+  gst_segment_init (&segment, GST_FORMAT_TIME);
+  fail_unless (gst_harness_push_event (h, gst_event_new_segment (&segment)));
+  check_audio_red_packet (h, 7, 3360, 43, 0, -1);
+  fail_unless (gst_harness_push_event (h, gst_event_new_flush_start ()));
+  fail_unless (gst_harness_push_event (h, gst_event_new_flush_stop (TRUE)));
+  fail_unless (gst_harness_push_event (h, gst_event_new_segment (&segment)));
+  check_audio_red_packet (h, 8, 3840, 43, 0, -1);
+  /* Primary RED is 29 bytes; adding redundancy would make it 49 bytes. */
+  g_object_set (h->element, "mtu", 40u, NULL);
+  check_audio_red_packet (h, 9, 4320, 43, 0, -1);
+  g_object_get (h->element, "skipped-size", &skipped, NULL);
+  fail_unless_equals_int (skipped, 1);
+  g_object_set (h->element, "mtu", 1200u, NULL);
+  check_audio_red_packet (h, 10, 4800, 43, 0, 9);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+GST_START_TEST (rtpredenc_video_fec_preserves_audio)
+{
+  GstHarness *h = gst_harness_new_parse (
+      "rtpulpfecenc media-pt=96 pt=122 percentage=100 multipacket=false ! "
+      "rtpredenc media-pt=96 fec-pt=122 pt=123");
+  guint i, audio_packets = 0, video_packets = 0;
+
+  gst_harness_set_src_caps_str (h, "application/x-rtp,clock-rate=(int)90000");
+  for (i = 0; i < 12; i++) {
+    gboolean audio = i % 3 != 0;
+    guint pt = audio ? (i % 2 ? 111 : 112) : 96;
+    GstBuffer *input = _new_rtp_buffer (TRUE, 0, pt, i, i * 480,
+        audio ? 42 : 43, 16);
+    fail_unless_equals_int (gst_harness_push (h, input), GST_FLOW_OK);
+    while (gst_harness_buffers_in_queue (h)) {
+      GstBuffer *output = gst_harness_pull (h);
+      GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+      fail_unless (gst_rtp_buffer_map (output, GST_MAP_READ, &rtp));
+      if (gst_rtp_buffer_get_ssrc (&rtp) == 42) {
+        fail_unless (audio);
+        fail_unless_equals_int (gst_rtp_buffer_get_payload_type (&rtp), pt);
+        fail_unless_equals_int (gst_rtp_buffer_get_seq (&rtp), i);
+        fail_unless_equals_int (gst_rtp_buffer_get_payload_len (&rtp), 16);
+        audio_packets++;
+      } else {
+        fail_unless_equals_int (gst_rtp_buffer_get_payload_type (&rtp), 123);
+        video_packets++;
+      }
+      gst_rtp_buffer_unmap (&rtp);
+      gst_buffer_unref (output);
+    }
+  }
+  fail_unless_equals_int (audio_packets, 8);
+  fail_unless (video_packets >= 4);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+/* Property updates compete with streaming; history remains streaming-owned. */
+static gpointer
+update_audio_red_distance (gpointer data)
+{
+  GstElement *element = data;
+  guint i;
+  for (i = 0; i < 10000; i++)
+    g_object_set (element, "distance", i % 11, NULL);
+  return NULL;
+}
+
+GST_START_TEST (rtpredenc_audio_concurrent_distance)
+{
+  GstHarness *h = gst_harness_new ("rtpredenc");
+  GThread *setter;
+  guint i;
+  g_object_set (h->element, "pt", PT_RED, "exact-distance", TRUE,
+      "mtu", 1136u, NULL);
+  gst_harness_set_src_caps_str (h, GST_RTP_RED_ENC_CAPS_STR);
+  setter = g_thread_new ("red-distance", update_audio_red_distance, h->element);
+  for (i = 0; i < 10000; i++) {
+    GstBuffer *output;
+    GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+    guint8 *payload;
+    guint size;
+    fail_unless_equals_int (gst_harness_push (h,
+            _new_rtp_buffer (TRUE, 0, PT_MEDIA, i, i * 480, 42, 160)), GST_FLOW_OK);
+    output = gst_harness_pull (h);
+    fail_unless (gst_rtp_buffer_map (output, GST_MAP_READ, &rtp));
+    fail_unless_equals_int (gst_rtp_buffer_get_seq (&rtp), i);
+    fail_unless_equals_int (gst_rtp_buffer_get_timestamp (&rtp), i * 480);
+    fail_unless_equals_int (gst_rtp_buffer_get_payload_type (&rtp), PT_RED);
+    payload = gst_rtp_buffer_get_payload (&rtp);
+    size = gst_rtp_buffer_get_payload_len (&rtp);
+    if (payload[0] & 0x80) {
+      guint offset = (payload[1] << 6) | (payload[2] >> 2);
+      fail_unless (offset >= 480 && offset <= 4800 && offset % 480 == 0);
+      fail_unless_equals_int (size, 325);
+    } else {
+      fail_unless_equals_int (size, 161);
+    }
+    gst_rtp_buffer_unmap (&rtp);
+    gst_buffer_unref (output);
+  }
+  g_thread_join (setter);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
+GST_START_TEST (rtpredenc_audio_high_bitrate_budget)
+{
+  GstHarness *h = gst_harness_new ("rtpredenc");
+  guint i, skipped;
+  g_object_set (h->element, "pt", PT_RED, "distance", 1u,
+      "exact-distance", TRUE, "mtu", 1136u, NULL);
+  gst_harness_set_src_caps_str (h, GST_RTP_RED_ENC_CAPS_STR);
+  for (i = 0; i < 3; i++) {
+    GstBuffer *input = _new_rtp_buffer (TRUE, 0, PT_MEDIA, i, i * 480, 42, 640);
+    GstBuffer *output;
+    GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+    guint8 extension[16] = {0};
+    fail_unless (gst_rtp_buffer_map (input, GST_MAP_READWRITE, &rtp));
+    fail_unless (gst_rtp_buffer_add_extension_onebyte_header (&rtp, 1, extension, sizeof (extension)));
+    gst_rtp_buffer_unmap (&rtp);
+    fail_unless_equals_int (gst_harness_push (h, input), GST_FLOW_OK);
+    output = gst_harness_pull (h);
+    fail_unless (gst_buffer_get_size (output) <= 1136);
+    fail_unless (gst_rtp_buffer_map (output, GST_MAP_READ, &rtp));
+    fail_unless_equals_int (gst_rtp_buffer_get_payload_len (&rtp), 641);
+    fail_unless (gst_rtp_buffer_get_extension (&rtp));
+    gst_rtp_buffer_unmap (&rtp);
+    gst_buffer_unref (output);
+  }
+  g_object_get (h->element, "skipped-size", &skipped, NULL);
+  fail_unless_equals_int (skipped, 2);
+  gst_harness_teardown (h);
+}
+GST_END_TEST;
+
 static Suite *
 rtpred_suite (void)
 {
@@ -888,6 +1174,13 @@ rtpred_suite (void)
   tcase_add_loop_test (tc_chain, rtpredenc_too_large_timestamp_offset, 0, 2);
   tcase_add_loop_test (tc_chain, rtpredenc_too_large_length, 0, 2);
   tcase_add_test (tc_chain, rtpredenc_transport_cc);
+  tcase_add_test (tc_chain, rtpredenc_audio_concurrent_distance);
+  tcase_add_test (tc_chain, rtpredenc_audio_high_bitrate_budget);
+  tcase_add_test (tc_chain, rtpredenc_audio_live_distance);
+  tcase_add_test (tc_chain, rtpredenc_audio_resets_and_budget);
+  tcase_add_test (tc_chain, rtpredenc_audio_telemetry);
+  tcase_add_test (tc_chain, rtpredenc_primary_mtu_error_event);
+  tcase_add_test (tc_chain, rtpredenc_video_fec_preserves_audio);
 
   return s;
 }

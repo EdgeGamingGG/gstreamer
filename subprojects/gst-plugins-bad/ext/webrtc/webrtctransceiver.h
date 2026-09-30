@@ -46,6 +46,10 @@ struct _WebRTCTransceiver
   GstWebRTCFECType         fec_type;
   guint                    fec_percentage;
   gboolean                 do_nack;
+  gboolean                 audio_red;
+  guint                    audio_red_distance;
+  gint                     audio_red_active; /* atomic negotiated state */
+  GstElement               *audio_redenc;
 
   /* The last caps that we put into to a SDP media section */
   GstCaps                  *last_retrieved_caps;
