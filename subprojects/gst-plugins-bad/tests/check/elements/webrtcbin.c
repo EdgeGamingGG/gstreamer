@@ -1238,6 +1238,104 @@ GST_START_TEST (test_audio)
 GST_END_TEST;
 
 static void
+set_audio_red_on_new_transceiver (GstElement * webrtc, GObject * trans,
+    gpointer data)
+{
+  g_object_set (trans, "audio-red", GPOINTER_TO_INT (data), NULL);
+}
+
+static void
+check_audio_red_sdp (struct test_webrtc *t, GstElement * element,
+    GstWebRTCSessionDescription * desc, gpointer data)
+{
+  const GstSDPMedia *media = gst_sdp_message_get_media (desc->sdp, 0);
+  gboolean expect_red = GPOINTER_TO_INT (data);
+  gboolean found_opus = FALSE, found_red = FALSE;
+  guint i;
+  for (i = 0; i < gst_sdp_media_formats_len (media); i++) {
+    gint pt = atoi (gst_sdp_media_get_format (media, i));
+    GstCaps *caps = gst_sdp_media_get_caps_from_media (media, pt);
+    const GstStructure *cs = gst_caps_get_structure (caps, 0);
+    const gchar *name = gst_structure_get_string (cs, "encoding-name");
+    if (!g_strcmp0 (name, "OPUS")) found_opus = TRUE;
+    if (!g_strcmp0 (name, "RED")) {
+      gint rate = 0;
+      found_red = TRUE;
+      fail_unless (gst_structure_get_int (cs, "clock-rate", &rate));
+      fail_unless_equals_int (rate, 48000);
+      fail_unless_equals_string (gst_structure_get_string (cs, "encoding-params"), "2");
+      fail_unless (gst_structure_has_field (cs, "96/96"));
+    }
+    fail_if (!g_strcmp0 (name, "ULPFEC"));
+    gst_caps_unref (caps);
+  }
+  fail_unless (found_opus);
+  fail_unless_equals_int (found_red, expect_red);
+}
+
+GST_START_TEST (test_audio_red_negotiation)
+{
+  struct test_webrtc *t = create_audio_test ();
+  GstWebRTCRTPTransceiver *trans = NULL;
+  gboolean active = FALSE;
+  VAL_SDP_INIT (offer, check_audio_red_sdp, GINT_TO_POINTER (TRUE), NULL);
+  VAL_SDP_INIT (answer, check_audio_red_sdp, GINT_TO_POINTER (__i__), NULL);
+
+  g_signal_emit_by_name (t->webrtc1, "get-transceiver", 0, &trans);
+  fail_unless (trans != NULL);
+  g_object_set (trans, "audio-red", TRUE, NULL);
+  g_signal_connect (t->webrtc2, "on-new-transceiver",
+      G_CALLBACK (set_audio_red_on_new_transceiver), GINT_TO_POINTER (__i__));
+  test_validate_sdp (t, &offer, &answer);
+  g_object_get (trans, "audio-red-active", &active, NULL);
+  fail_unless_equals_int (active, __i__);
+  gst_object_unref (trans);
+  test_webrtc_free (t);
+}
+GST_END_TEST;
+
+static void
+check_audio_red_missing_plugin (struct test_webrtc *t, GstBus *bus,
+    GstMessage *message, gpointer data)
+{
+  if (GST_MESSAGE_TYPE (message) == GST_MESSAGE_ERROR) {
+    GError *error = NULL;
+    gst_message_parse_error (message, &error, NULL);
+    if (error->domain == GST_CORE_ERROR && error->code == GST_CORE_ERROR_MISSING_PLUGIN &&
+        strstr (error->message, "audio RED encoder"))
+      *(gboolean *) data = TRUE;
+    g_clear_error (&error);
+  }
+}
+
+GST_START_TEST (test_audio_red_missing_plugin_event)
+{
+  struct test_webrtc *t = create_audio_test ();
+  GstWebRTCRTPTransceiver *trans = NULL;
+  GstRegistry *registry = gst_registry_get ();
+  GstElement *probe = gst_element_factory_make ("rtpredenc", NULL);
+  GstPluginFeature *redenc;
+  gboolean recorded = FALSE;
+
+  fail_unless (probe != NULL);
+  gst_object_unref (probe); /* Load the plugin before removing its factory. */
+  redenc = gst_registry_lookup_feature (registry, "rtpredenc");
+  fail_unless (redenc != NULL);
+  g_signal_emit_by_name (t->webrtc1, "get-transceiver", 0, &trans);
+  g_object_set (trans, "audio-red", TRUE, NULL);
+  gst_object_unref (trans);
+  t->bus_message = check_audio_red_missing_plugin;
+  t->bus_data = &recorded;
+  gst_registry_remove_feature (registry, redenc);
+  test_validate_sdp_full (t, NULL, NULL, 1 << STATE_ERROR, TRUE);
+  fail_unless (recorded);
+  test_webrtc_free (t);
+  gst_registry_add_feature (registry, redenc);
+  gst_object_unref (redenc);
+}
+GST_END_TEST;
+
+static void
 _check_ice_port_restriction (struct test_webrtc *t, GstElement * element,
     guint mlineindex, gchar * candidate, GstElement * other, gpointer user_data)
 {
@@ -6582,6 +6680,8 @@ webrtcbin_suite (void)
     }
 
     tcase_add_test (tc, test_audio);
+    tcase_add_loop_test (tc, test_audio_red_negotiation, 0, 2);
+    tcase_add_test (tc, test_audio_red_missing_plugin_event);
     tcase_add_test (tc, test_audio_sendrecv);
     tcase_add_test (tc, test_ice_port_restriction);
     tcase_add_test (tc, test_audio_video);

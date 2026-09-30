@@ -46,6 +46,9 @@ enum
   PROP_FEC_TYPE,
   PROP_FEC_PERCENTAGE,
   PROP_DO_NACK,
+  PROP_AUDIO_RED,
+  PROP_AUDIO_RED_DISTANCE,
+  PROP_AUDIO_RED_ACTIVE,
 };
 
 void
@@ -103,6 +106,16 @@ webrtc_transceiver_set_property (GObject * object, guint prop_id,
   switch (prop_id) {
     case PROP_WEBRTC:
       break;
+    case PROP_AUDIO_RED:
+      trans->audio_red = g_value_get_boolean (value);
+      break;
+    case PROP_AUDIO_RED_DISTANCE:
+      trans->audio_red_distance = g_value_get_uint (value);
+      if (trans->audio_redenc)
+        g_object_set (trans->audio_redenc, "distance",
+            g_atomic_int_get (&trans->audio_red_active) ?
+            trans->audio_red_distance : 0, NULL);
+      break;
     case PROP_FEC_TYPE:
       trans->fec_type = g_value_get_enum (value);
       break;
@@ -127,6 +140,15 @@ webrtc_transceiver_get_property (GObject * object, guint prop_id,
 
   GST_OBJECT_LOCK (trans);
   switch (prop_id) {
+    case PROP_AUDIO_RED:
+      g_value_set_boolean (value, trans->audio_red);
+      break;
+    case PROP_AUDIO_RED_DISTANCE:
+      g_value_set_uint (value, trans->audio_red_distance);
+      break;
+    case PROP_AUDIO_RED_ACTIVE:
+      g_value_set_boolean (value, g_atomic_int_get (&trans->audio_red_active));
+      break;
     case PROP_FEC_TYPE:
       g_value_set_enum (value, trans->fec_type);
       break;
@@ -152,6 +174,7 @@ webrtc_transceiver_finalize (GObject * object)
   gst_clear_object (&trans->ulpfecdec);
   gst_clear_object (&trans->ulpfecenc);
   gst_clear_object (&trans->redenc);
+  gst_clear_object (&trans->audio_redenc);
 
   if (trans->local_rtx_ssrc_map)
     gst_structure_free (trans->local_rtx_ssrc_map);
@@ -185,6 +208,19 @@ webrtc_transceiver_class_init (WebRTCTransceiverClass * klass)
           GST_TYPE_WEBRTC_BIN,
           G_PARAM_WRITABLE | G_PARAM_CONSTRUCT_ONLY | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_AUDIO_RED,
+      g_param_spec_boolean ("audio-red", "Audio RED",
+          "Offer RED-only protection for Opus (set before negotiation)",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_AUDIO_RED_DISTANCE,
+      g_param_spec_uint ("audio-red-distance", "Audio RED distance",
+          "Earlier Opus packet to copy; zero retains primary-only RED",
+          0, 10, 1, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_AUDIO_RED_ACTIVE,
+      g_param_spec_boolean ("audio-red-active", "Audio RED active",
+          "Whether the negotiated audio sender uses RED",
+          FALSE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
   g_object_class_install_property (gobject_class,
       PROP_FEC_TYPE,
       g_param_spec_enum ("fec-type", "FEC type",
@@ -211,6 +247,7 @@ webrtc_transceiver_class_init (WebRTCTransceiverClass * klass)
 static void
 webrtc_transceiver_init (WebRTCTransceiver * trans)
 {
+  trans->audio_red_distance = 1;
 }
 
 WebRTCTransceiver *

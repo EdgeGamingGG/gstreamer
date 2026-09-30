@@ -122,6 +122,7 @@ enum
 {
   PROP_0,
   PROP_PT,
+  PROP_MEDIA_PT,
   PROP_MULTIPACKET,
   PROP_PROTECTED,
   PROP_PERCENTAGE,
@@ -647,6 +648,13 @@ gst_rtp_ulpfec_enc_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
           GST_MAP_READ | GST_RTP_BUFFER_MAP_FLAG_SKIP_PADDING, &rtp)) {
     g_assert_not_reached ();
   }
+  {
+    gint media_pt = g_atomic_int_get (&fec->media_pt);
+    if (media_pt >= 0 && gst_rtp_buffer_get_payload_type (&rtp) != media_pt) {
+      gst_rtp_buffer_unmap (&rtp);
+      return gst_pad_push (fec->srcpad, buffer);
+    }
+  }
   ssrc = gst_rtp_buffer_get_ssrc (&rtp);
   gst_rtp_buffer_unmap (&rtp);
 
@@ -730,6 +738,9 @@ gst_rtp_ulpfec_enc_set_property (GObject * object, guint prop_id,
   GstRtpUlpFecEnc *fec = GST_RTP_ULPFEC_ENC (object);
 
   switch (prop_id) {
+    case PROP_MEDIA_PT:
+      g_atomic_int_set (&fec->media_pt, g_value_get_int (value));
+      return;
     case PROP_PT:
       fec->pt = g_value_get_uint (value);
       break;
@@ -759,6 +770,9 @@ gst_rtp_ulpfec_enc_get_property (GObject * object, guint prop_id,
 {
   GstRtpUlpFecEnc *fec = GST_RTP_ULPFEC_ENC (object);
   switch (prop_id) {
+    case PROP_MEDIA_PT:
+      g_value_set_int (value, g_atomic_int_get (&fec->media_pt));
+      break;
     case PROP_PT:
       g_value_set_uint (value, fec->pt);
       break;
@@ -795,6 +809,7 @@ gst_rtp_ulpfec_enc_dispose (GObject * obj)
 static void
 gst_rtp_ulpfec_enc_init (GstRtpUlpFecEnc * fec)
 {
+  fec->media_pt = -1;
   fec->srcpad = gst_pad_new_from_static_template (&srctemplate, "src");
   gst_element_add_pad (GST_ELEMENT (fec), fec->srcpad);
 
@@ -835,6 +850,11 @@ gst_rtp_ulpfec_enc_class_init (GstRtpUlpFecEncClass * klass)
   gobject_class->get_property =
       GST_DEBUG_FUNCPTR (gst_rtp_ulpfec_enc_get_property);
   gobject_class->dispose = GST_DEBUG_FUNCPTR (gst_rtp_ulpfec_enc_dispose);
+
+  g_object_class_install_property (gobject_class, PROP_MEDIA_PT,
+      g_param_spec_int ("media-pt", "Media payload type",
+          "Only protect this PT; other media and RTX pass unchanged (-1 = all)",
+          -1, 127, -1, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property (gobject_class, PROP_PT,
       g_param_spec_uint ("pt", "payload type",

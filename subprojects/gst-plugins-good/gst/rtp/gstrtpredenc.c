@@ -60,6 +60,7 @@ typedef struct
 {
   guint8 pt;
   guint32 timestamp;
+  guint16 seq;
   GstBuffer *payload;
 } RTPHistItem;
 
@@ -90,7 +91,16 @@ enum
   PROP_SENT,
   PROP_DISTANCE,
   PROP_ALLOW_NO_RED_BLOCKS,
-  PROP_EXCLUDE_PT
+  PROP_EXCLUDE_PT,
+  PROP_MEDIA_PT,
+  PROP_FEC_PT,
+  PROP_EXACT_DISTANCE,
+  PROP_MTU,
+  PROP_REDUNDANT_SENT,
+  PROP_SKIPPED_HISTORY,
+  PROP_SKIPPED_SIZE,
+  PROP_SKIPPED_FORMAT,
+  PROP_HISTORY_RESETS
 };
 
 static void
@@ -99,6 +109,7 @@ rtp_hist_item_init (RTPHistItem * item, GstRTPBuffer * rtp,
 {
   item->pt = gst_rtp_buffer_get_payload_type (rtp);
   item->timestamp = gst_rtp_buffer_get_timestamp (rtp);
+  item->seq = gst_rtp_buffer_get_seq (rtp);
   item->payload = rtp_payload;
 }
 
@@ -163,7 +174,7 @@ _alloc_red_packet_and_fill_headers (GstRtpRedEnc * self,
 
   /* Copying RTP header of incoming packet */
   gst_rtp_buffer_set_marker (&red_rtp, gst_rtp_buffer_get_marker (inp_rtp));
-  gst_rtp_buffer_set_payload_type (&red_rtp, self->pt);
+  gst_rtp_buffer_set_payload_type (&red_rtp, g_atomic_int_get (&self->pt));
   gst_rtp_buffer_set_seq (&red_rtp, gst_rtp_buffer_get_seq (inp_rtp));
   gst_rtp_buffer_set_timestamp (&red_rtp, timestamp);
   gst_rtp_buffer_set_ssrc (&red_rtp, gst_rtp_buffer_get_ssrc (inp_rtp));
@@ -182,9 +193,9 @@ _alloc_red_packet_and_fill_headers (GstRtpRedEnc * self,
       memcpy (red_ext_data, inp_ext_data, inp_ext_words * sizeof (guint32));
       copied_extensions = TRUE;
     } else {
-      GST_WARNING_OBJECT (self,
-          "Failed to copy RTP extensions to RED wrapper (profile=0x%04x words=%u)",
-          ext_bits, inp_ext_words);
+      GST_ELEMENT_WARNING (self, CORE, FAILED,
+          ("Failed to copy RTP extensions to RED wrapper"),
+          ("profile=0x%04x words=%u", ext_bits, inp_ext_words));
     }
   }
 
@@ -246,17 +257,29 @@ _create_red_packet (GstRtpRedEnc * self,
 
 static RTPHistItem *
 _red_history_get_redundant_block (GstRtpRedEnc * self,
-    guint32 current_timestamp, guint distance)
+    guint32 current_timestamp, guint16 current_seq, guint distance)
 {
   RTPHistItem *item;
   gint32 timestamp_offset;
 
-  if (0 == distance || 0 == self->rtp_history->length)
+  if (0 == distance)
     return NULL;
+  if (0 == self->rtp_history->length ||
+      (g_atomic_int_get (&self->exact_distance) &&
+          self->rtp_history->length < distance)) {
+    g_atomic_int_inc (&self->skipped_history);
+    return NULL;
+  }
 
   item = self->rtp_history->tail->data;
+  if (g_atomic_int_get (&self->exact_distance) &&
+      (guint16) (current_seq - item->seq) != distance) {
+    g_atomic_int_inc (&self->skipped_history);
+    return NULL;
+  }
   timestamp_offset = current_timestamp - item->timestamp;
   if (G_UNLIKELY (timestamp_offset > RED_BLOCK_TIMESTAMP_OFFSET_MAX)) {
+    g_atomic_int_inc (&self->skipped_format);
     GST_WARNING_OBJECT (self,
         "Can't create redundant block with distance %u, "
         "timestamp offset is too large %d (%u - %u) > %u",
@@ -266,6 +289,7 @@ _red_history_get_redundant_block (GstRtpRedEnc * self,
   }
 
   if (G_UNLIKELY (timestamp_offset < 0)) {
+    g_atomic_int_inc (&self->skipped_format);
     GST_WARNING_OBJECT (self,
         "Can't create redundant block with distance %u, "
         "timestamp offset is negative %d (%u - %u)",
@@ -274,6 +298,7 @@ _red_history_get_redundant_block (GstRtpRedEnc * self,
   }
 
   if (G_UNLIKELY (gst_buffer_get_size (item->payload) > RED_BLOCK_LENGTH_MAX)) {
+    g_atomic_int_inc (&self->skipped_format);
     GST_WARNING_OBJECT (self,
         "Can't create redundant block with distance %u, "
         "red block is too large %u > %u",
@@ -324,22 +349,71 @@ _red_history_trim (GstRtpRedEnc * self, guint max_history_length)
     rtp_hist_item_free (g_queue_pop_tail (self->rtp_history));
 }
 
+static void
+_report_audio_red (GstRtpRedEnc * self, gboolean final)
+{
+  const gchar *names[] = { "sent", "redundant-sent", "skipped-history",
+    "skipped-size", "skipped-format", "history-resets" };
+  gint *counters[] = { &self->num_sent, &self->redundant_sent,
+    &self->skipped_history, &self->skipped_size, &self->skipped_format,
+    &self->history_resets };
+  gint64 now = g_get_monotonic_time ();
+  GstStructure *stats;
+  gboolean degraded = FALSE, changed = FALSE;
+  guint i;
+
+  if (!g_atomic_int_get (&self->exact_distance) ||
+      (!final && self->last_report_us && now - self->last_report_us < G_USEC_PER_SEC))
+    return;
+  stats = gst_structure_new ("audio-red-stats",
+      "distance", G_TYPE_UINT, (guint) g_atomic_int_get (&self->distance),
+      "mtu", G_TYPE_UINT, (guint) g_atomic_int_get (&self->mtu),
+      "final", G_TYPE_BOOLEAN, final, NULL);
+  for (i = 0; i < G_N_ELEMENTS (counters); i++) {
+    guint current = (guint) g_atomic_int_get (counters[i]);
+    guint delta = current - self->report_counters[i];
+    gchar *delta_name = g_strconcat (names[i], "-delta", NULL);
+    gst_structure_set (stats, names[i], G_TYPE_UINT, current,
+        delta_name, G_TYPE_UINT, delta, NULL);
+    g_free (delta_name);
+    changed |= delta != 0;
+    if (i == 3 || i == 4)
+      degraded |= delta != 0;
+    self->report_counters[i] = current;
+  }
+  self->last_report_us = now;
+  if (!changed) {
+    gst_structure_free (stats);
+    return;
+  }
+  gst_structure_set (stats, "degraded", G_TYPE_BOOLEAN, degraded, NULL);
+  gst_element_post_message (GST_ELEMENT (self),
+      gst_message_new_element (GST_OBJECT (self), stats));
+}
+
 static GstFlowReturn
 _pad_push (GstRtpRedEnc * self, GstBuffer * buffer, gboolean is_red)
 {
-  if (self->send_caps || is_red != self->is_current_caps_red) {
+  gint pt = g_atomic_int_get (&self->pt);
+  if (is_red != self->is_current_caps_red || (is_red && pt != self->last_output_pt)) {
     GstEvent *event;
     GstCaps *caps = gst_pad_get_current_caps (self->sinkpad);
     if (is_red)
-      event = _create_caps_event (caps, self->pt);
+      event = _create_caps_event (caps, g_atomic_int_get (&self->pt));
     else
       event = gst_event_new_caps (caps);
     gst_caps_unref (caps);
 
-    gst_pad_push_event (self->srcpad, event);
-    self->send_caps = FALSE;
+    if (!gst_pad_push_event (self->srcpad, event)) {
+      gst_buffer_unref (buffer);
+      GST_ELEMENT_ERROR (self, CORE, NEGOTIATION,
+          ("Downstream rejected RED output caps"), (NULL));
+      return GST_FLOW_NOT_NEGOTIATED;
+    }
+    self->last_output_pt = pt;
     self->is_current_caps_red = is_red;
   }
+  _report_audio_red (self, FALSE);
   return gst_pad_push (self->srcpad, buffer);
 }
 
@@ -368,7 +442,9 @@ _push_red_packet (GstRtpRedEnc * self,
   gst_rtp_buffer_unmap (rtp);
   gst_buffer_unref (buffer);
 
-  self->num_sent++;
+  g_atomic_int_inc (&self->num_sent);
+  if (redundant_block)
+    g_atomic_int_inc (&self->redundant_sent);
   return _pad_push (self, red_buffer, TRUE);
 }
 
@@ -377,8 +453,10 @@ gst_rtp_red_enc_chain (GstPad G_GNUC_UNUSED * pad, GstObject * parent,
     GstBuffer * buffer)
 {
   GstRtpRedEnc *self = GST_RTP_RED_ENC (parent);
-  guint distance = self->distance;
-  guint only_with_redundant_data = !self->allow_no_red_blocks;
+  guint distance = (guint) g_atomic_int_get (&self->distance);
+  guint only_with_redundant_data = !g_atomic_int_get (&self->allow_no_red_blocks);
+  gint media_pt = g_atomic_int_get (&self->media_pt);
+  gint mtu = g_atomic_int_get (&self->mtu);
   RTPHistItem *redundant_block;
   GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
 
@@ -391,19 +469,47 @@ gst_rtp_red_enc_chain (GstPad G_GNUC_UNUSED * pad, GstObject * parent,
   if (!gst_rtp_buffer_map (buffer, GST_MAP_READ, &rtp))
     return _pad_push (self, buffer, self->is_current_caps_red);
 
-  if (self->exclude_pt >= 0) {
+  {
     guint8 incoming_pt = gst_rtp_buffer_get_payload_type (&rtp);
-    if (incoming_pt == (guint8) self->exclude_pt) {
+    if (incoming_pt == g_atomic_int_get (&self->exclude_pt) ||
+        (media_pt >= 0 && incoming_pt != media_pt &&
+            incoming_pt != g_atomic_int_get (&self->fec_pt))) {
       gst_rtp_buffer_unmap (&rtp);
       return _pad_push (self, buffer, FALSE);
     }
   }
 
+  if (GST_BUFFER_FLAG_IS_SET (buffer, GST_BUFFER_FLAG_DISCONT) ||
+      (self->have_history_ssrc &&
+          self->history_ssrc != gst_rtp_buffer_get_ssrc (&rtp))) {
+    _red_history_trim (self, 0);
+    g_atomic_int_inc (&self->history_resets);
+  }
+  self->history_ssrc = gst_rtp_buffer_get_ssrc (&rtp);
+  self->have_history_ssrc = TRUE;
+
   /* If can't get data for redundant block push the packet as is */
   redundant_block = _red_history_get_redundant_block (self,
-      gst_rtp_buffer_get_timestamp (&rtp), distance);
+      gst_rtp_buffer_get_timestamp (&rtp), gst_rtp_buffer_get_seq (&rtp), distance);
   if (NULL == redundant_block && only_with_redundant_data)
     return _push_nonred_packet (self, &rtp, buffer, distance);
+
+  if (mtu > 0) {
+    gsize primary_size = gst_rtp_buffer_get_header_len (&rtp) +
+        gst_rtp_buffer_get_payload_len (&rtp) + 1;
+    if (primary_size > (gsize) mtu) {
+      gst_rtp_buffer_unmap (&rtp);
+      gst_buffer_unref (buffer);
+      GST_ELEMENT_ERROR (self, STREAM, FORMAT,
+          ("Primary RED packet exceeds configured RTP MTU"), (NULL));
+      return GST_FLOW_ERROR;
+    }
+    if (redundant_block && primary_size + 4 +
+        gst_buffer_get_size (redundant_block->payload) > (gsize) mtu) {
+      redundant_block = NULL;
+      g_atomic_int_inc (&self->skipped_size);
+    }
+  }
 
   /* About to create RED packet with or without redundant data */
   return _push_red_packet (self, &rtp, buffer, redundant_block, distance);
@@ -440,12 +546,23 @@ gst_rtp_red_enc_event_sink (GstPad * pad, GstObject * parent, GstEvent * event)
   GstRtpRedEnc *self = GST_RTP_RED_ENC (parent);
 
   switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_EOS:
+      _report_audio_red (self, TRUE);
+      break;
+    /* These events are serialized with chain(). FLUSH_START is not. */
+    case GST_EVENT_STREAM_START:
+    case GST_EVENT_FLUSH_STOP:
+    case GST_EVENT_SEGMENT:
+      _red_history_trim (self, 0);
+      self->have_history_ssrc = FALSE;
+      g_atomic_int_inc (&self->history_resets);
+      break;
     case GST_EVENT_CAPS:
     {
       GstCaps *caps;
       GstStructure *s;
       gboolean replace_with_red_caps =
-          self->is_current_caps_red || self->allow_no_red_blocks;
+          self->is_current_caps_red || g_atomic_int_get (&self->allow_no_red_blocks);
 
       gst_event_parse_caps (event, &caps);
       s = gst_caps_get_structure (caps, 0);
@@ -454,9 +571,10 @@ gst_rtp_red_enc_event_sink (GstPad * pad, GstObject * parent, GstEvent * event)
       GST_INFO_OBJECT (self, "TWCC extension ID: %u", self->twcc_ext_id);
 
       if (replace_with_red_caps) {
-        gst_event_take (&event, _create_caps_event (caps, self->pt));
+        gst_event_take (&event, _create_caps_event (caps, g_atomic_int_get (&self->pt)));
 
         self->is_current_caps_red = TRUE;
+        self->last_output_pt = g_atomic_int_get (&self->pt);
       }
       break;
     }
@@ -472,7 +590,10 @@ gst_rtp_red_enc_dispose (GObject * obj)
 {
   GstRtpRedEnc *self = GST_RTP_RED_ENC (obj);
 
-  g_queue_free_full (self->rtp_history, rtp_hist_item_free);
+  if (self->rtp_history) {
+    g_queue_free_full (self->rtp_history, rtp_hist_item_free);
+    self->rtp_history = NULL;
+  }
 
   G_OBJECT_CLASS (gst_rtp_red_enc_parent_class)->dispose (obj);
 }
@@ -499,12 +620,15 @@ gst_rtp_red_enc_init (GstRtpRedEnc * self)
   gst_element_add_pad (GST_ELEMENT (self), self->sinkpad);
 
   self->pt = DEFAULT_PT;
+  self->last_output_pt = DEFAULT_PT;
   self->distance = DEFAULT_DISTANCE;
   self->allow_no_red_blocks = DEFAULT_ALLOW_NO_RED_BLOCKS;
   self->num_sent = 0;
   self->rtp_history = g_queue_new ();
   self->ignoring_extension_warned = FALSE;
   self->exclude_pt = -1;
+  self->media_pt = -1;
+  self->fec_pt = -1;
 }
 
 
@@ -515,20 +639,28 @@ gst_rtp_red_enc_set_property (GObject * object, guint prop_id,
   GstRtpRedEnc *self = GST_RTP_RED_ENC (object);
   switch (prop_id) {
     case PROP_PT:
-    {
-      gint prev_pt = self->pt;
-      self->pt = g_value_get_int (value);
-      self->send_caps = self->pt != prev_pt && self->is_current_caps_red;
-    }
+      g_atomic_int_set (&self->pt, g_value_get_int (value));
       break;
     case PROP_DISTANCE:
-      self->distance = g_value_get_uint (value);
+      g_atomic_int_set (&self->distance, g_value_get_uint (value));
       break;
     case PROP_ALLOW_NO_RED_BLOCKS:
-      self->allow_no_red_blocks = g_value_get_boolean (value);
+      g_atomic_int_set (&self->allow_no_red_blocks, g_value_get_boolean (value));
       break;
     case PROP_EXCLUDE_PT:
-      self->exclude_pt = g_value_get_int (value);
+      g_atomic_int_set (&self->exclude_pt, g_value_get_int (value));
+      break;
+    case PROP_MTU:
+      g_atomic_int_set (&self->mtu, g_value_get_uint (value));
+      break;
+    case PROP_EXACT_DISTANCE:
+      g_atomic_int_set (&self->exact_distance, g_value_get_boolean (value));
+      break;
+    case PROP_FEC_PT:
+      g_atomic_int_set (&self->fec_pt, g_value_get_int (value));
+      break;
+    case PROP_MEDIA_PT:
+      g_atomic_int_set (&self->media_pt, g_value_get_int (value));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -543,19 +675,46 @@ gst_rtp_red_enc_get_property (GObject * object, guint prop_id,
   GstRtpRedEnc *self = GST_RTP_RED_ENC (object);
   switch (prop_id) {
     case PROP_PT:
-      g_value_set_int (value, self->pt);
+      g_value_set_int (value, g_atomic_int_get (&self->pt));
       break;
     case PROP_SENT:
-      g_value_set_uint (value, self->num_sent);
+      g_value_set_uint (value, (guint) g_atomic_int_get (&self->num_sent));
+      break;
+    case PROP_HISTORY_RESETS:
+      g_value_set_uint (value, (guint) g_atomic_int_get (&self->history_resets));
+      break;
+    case PROP_SKIPPED_FORMAT:
+      g_value_set_uint (value, (guint) g_atomic_int_get (&self->skipped_format));
+      break;
+    case PROP_SKIPPED_SIZE:
+      g_value_set_uint (value, (guint) g_atomic_int_get (&self->skipped_size));
+      break;
+    case PROP_SKIPPED_HISTORY:
+      g_value_set_uint (value, (guint) g_atomic_int_get (&self->skipped_history));
+      break;
+    case PROP_REDUNDANT_SENT:
+      g_value_set_uint (value, (guint) g_atomic_int_get (&self->redundant_sent));
       break;
     case PROP_DISTANCE:
-      g_value_set_uint (value, self->distance);
+      g_value_set_uint (value, (guint) g_atomic_int_get (&self->distance));
       break;
     case PROP_ALLOW_NO_RED_BLOCKS:
-      g_value_set_boolean (value, self->allow_no_red_blocks);
+      g_value_set_boolean (value, g_atomic_int_get (&self->allow_no_red_blocks));
       break;
     case PROP_EXCLUDE_PT:
-      g_value_set_int (value, self->exclude_pt);
+      g_value_set_int (value, g_atomic_int_get (&self->exclude_pt));
+      break;
+    case PROP_MTU:
+      g_value_set_uint (value, g_atomic_int_get (&self->mtu));
+      break;
+    case PROP_EXACT_DISTANCE:
+      g_value_set_boolean (value, g_atomic_int_get (&self->exact_distance));
+      break;
+    case PROP_FEC_PT:
+      g_value_set_int (value, g_atomic_int_get (&self->fec_pt));
+      break;
+    case PROP_MEDIA_PT:
+      g_value_set_int (value, g_atomic_int_get (&self->media_pt));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -620,6 +779,39 @@ gst_rtp_red_enc_class_init (GstRtpRedEncClass * klass)
           "Pass through packets matching this PT unchanged (no RED wrapping). "
           "-1 means wrap all incoming packets (default behavior).",
           -1, 127, -1, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_MEDIA_PT,
+      g_param_spec_int ("media-pt", "media-pt", "Only wrap this media PT and fec-pt; -1 wraps all",
+          -1, 127, -1, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_FEC_PT,
+      g_param_spec_int ("fec-pt", "fec-pt", "Additional FEC PT to wrap when media-pt is configured",
+          -1, 127, -1, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_EXACT_DISTANCE,
+      g_param_spec_boolean ("exact-distance", "Exact distance",
+          "Send primary-only until the requested sequence distance is available",
+          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_MTU,
+      g_param_spec_uint ("mtu", "RTP MTU",
+          "Maximum RED RTP packet size; zero is unlimited",
+          0, G_MAXINT, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_REDUNDANT_SENT,
+      g_param_spec_uint ("redundant-sent", "redundant-sent", "redundant-sent",
+          0, G_MAXUINT, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_SKIPPED_HISTORY,
+      g_param_spec_uint ("skipped-history", "skipped-history", "skipped-history",
+          0, G_MAXUINT, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_SKIPPED_SIZE,
+      g_param_spec_uint ("skipped-size", "skipped-size", "skipped-size",
+          0, G_MAXUINT, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_SKIPPED_FORMAT,
+      g_param_spec_uint ("skipped-format", "skipped-format", "skipped-format",
+          0, G_MAXUINT, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_HISTORY_RESETS,
+      g_param_spec_uint ("history-resets", "history-resets", "history-resets",
+          0, G_MAXUINT, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
   GST_DEBUG_CATEGORY_INIT (gst_rtp_red_enc_debug, "rtpredenc", 0,
       "RTP RED Encoder");

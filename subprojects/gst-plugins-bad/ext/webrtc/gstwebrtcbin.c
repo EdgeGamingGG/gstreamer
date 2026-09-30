@@ -2991,6 +2991,26 @@ _pick_fec_payload_types (GstWebRTCBin * webrtc, WebRTCTransceiver * trans,
 {
   gboolean ret = TRUE;
 
+  if (trans->audio_red && !g_strcmp0 (gst_sdp_media_get_media (media), "audio") && clockrate == 48000) {
+    struct media_payload_map_item *item;
+    gchar *str;
+
+    item = find_or_create_payload_map_for_media_pt (media_mapping, media_pt);
+    if (item->red_pt == G_MAXUINT &&
+        !(ret = _pick_available_pt (media_mapping, &item->red_pt)))
+      goto done;
+    str = g_strdup_printf ("%u", item->red_pt);
+    gst_sdp_media_add_format (media, str);
+    g_free (str);
+    str = g_strdup_printf ("%u red/48000/2", item->red_pt);
+    gst_sdp_media_add_attribute (media, "rtpmap", str);
+    g_free (str);
+    str = g_strdup_printf ("%u %d/%d", item->red_pt, media_pt, media_pt);
+    gst_sdp_media_add_attribute (media, "fmtp", str);
+    g_free (str);
+    goto done;
+  }
+
   if (trans->fec_type == GST_WEBRTC_FEC_TYPE_NONE)
     goto done;
 
@@ -3660,8 +3680,18 @@ sdp_media_from_transceiver (GstWebRTCBin * webrtc, GstSDPMedia * media,
       }
     }
 
-    _pick_fec_payload_types (webrtc, WEBRTC_TRANSCEIVER (trans), media_mapping,
-        clockrate, media_pt, &rtx_target_pt, media);
+    if (!WEBRTC_TRANSCEIVER (trans)->audio_red ||
+        !g_strcmp0 (gst_structure_get_string (s, "encoding-name"), "OPUS")) {
+      if (!_pick_fec_payload_types (webrtc, WEBRTC_TRANSCEIVER (trans), media_mapping,
+              clockrate, media_pt, &rtx_target_pt, media)) {
+        g_set_error (error, GST_WEBRTC_ERROR, GST_WEBRTC_ERROR_INTERNAL_FAILURE,
+            "No RTP payload type available for FEC on m-line %u", media_idx);
+        GST_ELEMENT_ERROR (webrtc, CORE, NEGOTIATION,
+            ("No RTP payload type available for FEC"), ("m-line=%u", media_idx));
+        gst_caps_unref (caps);
+        return FALSE;
+      }
+    }
     _pick_rtx_payload_types (webrtc, WEBRTC_TRANSCEIVER (trans), media_mapping,
         clockrate, media_pt, rtx_target_pt, rtx_target_ssrc, media);
   }
@@ -4293,6 +4323,39 @@ _media_add_fec (GstSDPMedia * media, WebRTCTransceiver * trans, GstCaps * caps,
 {
   guint i;
 
+  if (trans->audio_red && !g_strcmp0 (gst_sdp_media_get_media (media), "audio")) {
+    gint opus_pt = -1;
+    for (i = 0; i < gst_caps_get_size (caps); i++) {
+      const GstStructure *s = gst_caps_get_structure (caps, i);
+      if (!g_strcmp0 (gst_structure_get_string (s, "encoding-name"), "OPUS"))
+        gst_structure_get_int (s, "payload", &opus_pt);
+    }
+    if (opus_pt >= 0) {
+      gchar *mapping = g_strdup_printf ("%d/%d", opus_pt, opus_pt);
+      for (i = 0; i < gst_caps_get_size (caps); i++) {
+        const GstStructure *s = gst_caps_get_structure (caps, i);
+        gint pt, rate;
+        if (!g_strcmp0 (gst_structure_get_string (s, "encoding-name"), "RED") &&
+            gst_structure_get_int (s, "payload", &pt) &&
+            gst_structure_get_int (s, "clock-rate", &rate) && rate == 48000 &&
+            !g_strcmp0 (gst_structure_get_string (s, "encoding-params"), "2") &&
+            gst_structure_has_field (s, mapping)) {
+          gchar *str = g_strdup_printf ("%d", pt);
+          gst_sdp_media_add_format (media, str);
+          g_free (str);
+          str = g_strdup_printf ("%d red/48000/2", pt);
+          gst_sdp_media_add_attribute (media, "rtpmap", str);
+          g_free (str);
+          str = g_strdup_printf ("%d %s", pt, mapping);
+          gst_sdp_media_add_attribute (media, "fmtp", str);
+          g_free (str);
+          break;
+        }
+      }
+      g_free (mapping);
+    }
+    return;
+  }
   if (trans->fec_type == GST_WEBRTC_FEC_TYPE_NONE)
     return;
 
@@ -5148,6 +5211,33 @@ connect_rtpbin_with_sendbin (GstWebRTCBin * webrtc, guint session_id,
   g_free (rtp_pad_name);
 }
 
+static gboolean
+_audio_red_is_negotiated (TransportStream * stream, guint mline, gint red_pt)
+{
+  gint opus_pt = transport_stream_get_pt (stream, "OPUS", mline);
+  GstCaps *caps;
+  const GstStructure *s;
+  gchar *mapping;
+  gint rate;
+  gboolean ret;
+
+  if (opus_pt < 0 || red_pt < 0)
+    return FALSE;
+  caps = transport_stream_get_caps_for_pt (stream, red_pt);
+  if (!caps || gst_caps_is_empty (caps)) {
+    gst_clear_caps (&caps);
+    return FALSE;
+  }
+  s = gst_caps_get_structure (caps, 0);
+  mapping = g_strdup_printf ("%d/%d", opus_pt, opus_pt);
+  ret = gst_structure_get_int (s, "clock-rate", &rate) && rate == 48000 &&
+      !g_strcmp0 (gst_structure_get_string (s, "encoding-params"), "2") &&
+      gst_structure_has_field (s, mapping);
+  g_free (mapping);
+  gst_caps_unref (caps);
+  return ret;
+}
+
 static void
 _set_internal_rtpbin_element_props_from_stream (GstWebRTCBin * webrtc,
     TransportStream * stream)
@@ -5218,6 +5308,17 @@ _set_internal_rtpbin_element_props_from_stream (GstWebRTCBin * webrtc,
           GST_PTR_FORMAT " has FEC payload %d and RED payload %d", stream,
           trans, ulpfec_pt, red_pt);
 
+      if (trans->audio_redenc) {
+        gboolean active = trans->audio_red &&
+            _audio_red_is_negotiated (stream, rtp_trans->mline, red_pt);
+        GST_OBJECT_LOCK (trans);
+        g_object_set (trans->audio_redenc, "pt", active ? red_pt : 0,
+            "allow-no-red-blocks", active, "distance",
+            active ? trans->audio_red_distance : 0, NULL);
+        g_atomic_int_set (&trans->audio_red_active, active);
+        GST_OBJECT_UNLOCK (trans);
+      }
+
       if (trans->ulpfecenc) {
         guint ulpfecenc_pt = ulpfec_pt;
 
@@ -5245,67 +5346,28 @@ _set_internal_rtpbin_element_props_from_stream (GstWebRTCBin * webrtc,
         g_object_set (trans->redenc, "pt", red_pt, "allow-no-red-blocks",
             always_produce, NULL);
 
-        /* In a bundled transport this RED encoder sits after the shared
-         * rtpbin output, so it can see packets for other m-lines too. Audio
-         * must remain plain Opus; otherwise Chrome sees the audio SSRC with
-         * the video RED payload type and never creates inbound audio RTP
-         * stats. Prefer preserving audio over raw RTX when both are present. */
+        /* FEC is downstream of the bundled rtpbin output. Positively select
+         * this transceiver's media so audio (Opus or RED) and raw RTX pass
+         * BOTH stages unchanged, including sequence numbers. */
         {
           guint j;
-          gint media_codec_pt = -1;
-          gint rtx_pt_for_media = -1;
-          gint audio_pt = -1;
-          gint exclude_pt = -1;
-
-          /* First find the primary media PT */
+          gint media_pt = -1;
           for (j = 0; j < stream->ptmap->len; j++) {
-            PtMapItem *pitem = &g_array_index (stream->ptmap, PtMapItem, j);
-            if (pitem->media_idx == rtp_trans->mline && pitem->caps) {
-              GstStructure *ps = gst_caps_get_structure (pitem->caps, 0);
-              const gchar *enc = gst_structure_get_string (ps, "encoding-name");
-              if (enc && g_strcmp0 (enc, "RED") != 0
-                  && g_strcmp0 (enc, "ULPFEC") != 0
-                  && g_strcmp0 (enc, "RTX") != 0) {
-                media_codec_pt = pitem->pt;
+            PtMapItem *item = &g_array_index (stream->ptmap, PtMapItem, j);
+            if (item->media_idx == rtp_trans->mline && item->caps) {
+              const GstStructure *s = gst_caps_get_structure (item->caps, 0);
+              const gchar *enc = gst_structure_get_string (s, "encoding-name");
+              if (enc && g_strcmp0 (enc, "RED") && g_strcmp0 (enc, "ULPFEC") &&
+                  g_strcmp0 (enc, "RTX")) {
+                media_pt = item->pt;
                 break;
               }
             }
           }
-
-          for (j = 0; j < stream->ptmap->len; j++) {
-            PtMapItem *pitem = &g_array_index (stream->ptmap, PtMapItem, j);
-            if (pitem->media_idx != rtp_trans->mline && pitem->caps) {
-              GstStructure *ps = gst_caps_get_structure (pitem->caps, 0);
-              const gchar *enc = gst_structure_get_string (ps, "encoding-name");
-              if (enc && g_strcmp0 (enc, "OPUS") == 0) {
-                audio_pt = pitem->pt;
-                break;
-              }
-            }
-          }
-
-          /* Then find the RTX PT whose apt matches the media codec PT */
-          if (media_codec_pt >= 0) {
-            gchar apt_str[8];
-            g_snprintf (apt_str, sizeof (apt_str), "%d", media_codec_pt);
-            for (j = 0; j < stream->ptmap->len; j++) {
-              PtMapItem *pitem = &g_array_index (stream->ptmap, PtMapItem, j);
-              if (pitem->media_idx == rtp_trans->mline && pitem->caps) {
-                GstStructure *ps = gst_caps_get_structure (pitem->caps, 0);
-                const gchar *enc = gst_structure_get_string (ps, "encoding-name");
-                const gchar *apt = gst_structure_get_string (ps, "apt");
-                if (enc && g_strcmp0 (enc, "RTX") == 0
-                    && apt && g_strcmp0 (apt, apt_str) == 0) {
-                  rtx_pt_for_media = pitem->pt;
-                  break;
-                }
-              }
-            }
-          }
-
-          exclude_pt = audio_pt >= 0 ? audio_pt : rtx_pt_for_media;
-          if (exclude_pt >= 0)
-            g_object_set (trans->redenc, "exclude-pt", exclude_pt, NULL);
+          if (trans->ulpfecenc)
+            g_object_set (trans->ulpfecenc, "media-pt", media_pt, NULL);
+          g_object_set (trans->redenc, "media-pt", media_pt, "fec-pt",
+              ulpfec_pt > 0 ? ulpfec_pt : -1, NULL);
         }
       }
 
@@ -5383,6 +5445,43 @@ _connect_input_stream (GstWebRTCBin * webrtc, GstWebRTCBinPad * pad)
   gst_element_sync_state_with_parent (clocksync);
 
   srcpad = gst_element_get_static_pad (clocksync, "src");
+
+  /* Audio RED is owned by its transceiver before bundling. Video FEC keeps
+   * its post-rtpbin placement so video RTX remains in its original format. */
+  if (trans->audio_red && pad->trans->kind == GST_WEBRTC_KIND_AUDIO) {
+    GstElement *redenc = gst_element_factory_make ("rtpredenc", NULL);
+    if (!redenc) {
+      GST_ELEMENT_ERROR (webrtc, CORE, MISSING_PLUGIN,
+          ("Failed to create audio RED encoder"), ("m-line=%u", pad->trans->mline));
+      gst_object_unref (srcpad);
+      return NULL;
+    }
+    if (!g_object_class_find_property (G_OBJECT_GET_CLASS (redenc), "exact-distance") ||
+        !g_object_class_find_property (G_OBJECT_GET_CLASS (redenc), "mtu")) {
+      GST_ELEMENT_ERROR (webrtc, CORE, MISSING_PLUGIN,
+          ("Audio RED encoder lacks required distance/MTU support"), (NULL));
+      gst_object_unref (redenc);
+      gst_object_unref (srcpad);
+      return NULL;
+    }
+    GST_OBJECT_LOCK (trans);
+    trans->audio_redenc = gst_object_ref_sink (redenc);
+    GST_OBJECT_UNLOCK (trans);
+    /* Reserve 64 bytes for downstream RTP extensions and SRTP below the
+     * application's 1200-byte transport target. */
+    g_object_set (redenc, "exact-distance", TRUE, "mtu", 1136u,
+        "allow-no-red-blocks", FALSE, "distance", 0u, NULL);
+    if (!gst_bin_add (GST_BIN (webrtc), redenc) ||
+        !gst_element_link (clocksync, redenc) ||
+        !gst_element_sync_state_with_parent (redenc)) {
+      GST_ELEMENT_ERROR (webrtc, CORE, FAILED,
+          ("Failed to attach or start audio RED encoder"), ("m-line=%u", pad->trans->mline));
+      gst_object_unref (srcpad);
+      return NULL;
+    }
+    gst_object_unref (srcpad);
+    srcpad = gst_element_get_static_pad (redenc, "src");
+  }
 
   fec_encoder = NULL;
   if (trans->fec_type != GST_WEBRTC_FEC_TYPE_NONE && !trans->fec_bin) {
